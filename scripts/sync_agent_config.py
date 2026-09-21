@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Sync MCP, skills, and agent instruction files across Cursor, Claude, Codex, and Zcode."""
+"""Sync MCP, skills, and agent instructions across Cursor, Claude, Codex, Zcode, and Qoder."""
 
 from __future__ import annotations
 
@@ -8,6 +8,7 @@ import json
 import os
 import re
 import shutil
+import subprocess
 import sys
 import tempfile
 import tomllib
@@ -23,6 +24,7 @@ AGENT_SKILL_DIRS = (
     ".codex/skills",
     ".claude/skills",
     ".zcode/skills",
+    ".qoder/skills",
 )
 CANONICAL_SKILLS = Path(".agents/skills")
 
@@ -202,10 +204,16 @@ def load_zcode_servers(path: Path) -> dict:
     return {name: zcode_server_to_canonical(cfg) for name, cfg in raw.items() if isinstance(cfg, dict)}
 
 
-def load_mcp_json_servers(path: Path, *, from_cursor: bool) -> dict:
+def load_mcp_json_servers(
+    path: Path, *, from_cursor: bool, allow_missing_servers: bool = False
+) -> dict:
     if not path.exists():
         return {}
     data = json.loads(path.read_text(encoding="utf-8"))
+    if not isinstance(data, dict):
+        raise SystemExit(f"{path} must be a JSON object")
+    if allow_missing_servers and "mcpServers" not in data:
+        return {}
     servers = data.get("mcpServers")
     if not isinstance(servers, dict):
         raise SystemExit(f"{path}: expected top-level mcpServers object")
@@ -222,6 +230,9 @@ def merge_mcp_servers(root: Path) -> dict[str, dict]:
     layers: list[tuple[str, dict]] = [
         ("codex", load_codex_servers(root / ".codex" / "config.toml")),
         ("zcode", load_zcode_servers(root / ".zcode" / "config.json")),
+        ("qoder", load_mcp_json_servers(
+            root / ".qoder" / "settings.json", from_cursor=False, allow_missing_servers=True
+        )),
         ("claude", load_mcp_json_servers(root / ".mcp.json", from_cursor=False)),
         ("cursor", load_mcp_json_servers(root / ".cursor" / "mcp.json", from_cursor=True)),
         ("agents", load_mcp_json_servers(root / ".agents" / "mcp.json", from_cursor=False)),
@@ -259,6 +270,27 @@ def render_zcode_config(servers: dict, existing: Path) -> str:
         mcp = {}
         data["mcp"] = mcp
     mcp["servers"] = {name: zcode_server_from_canonical(cfg) for name, cfg in servers.items()}
+    return render_json(data)
+
+
+def qoder_server_from_canonical(cfg: dict) -> dict:
+    out = deepcopy(cfg)
+    bearer = out.pop("bearerTokenEnvVar", None)
+    if bearer:
+        headers = {key: value for key, value in (out.get("headers") or {}).items()
+                   if key.lower() != "authorization"}
+        headers["Authorization"] = f"Bearer ${{{bearer}}}"
+        out["headers"] = headers
+    return out
+
+
+def render_qoder_config(servers: dict, existing: Path) -> str:
+    data: dict = {}
+    if existing.exists():
+        data = json.loads(existing.read_text(encoding="utf-8"))
+        if not isinstance(data, dict):
+            raise SystemExit(f"{existing} must be a JSON object")
+    data["mcpServers"] = servers
     return render_json(data)
 
 
@@ -432,29 +464,34 @@ def sync_mcp(
     codex_out: Path,
     mcp_out: Path,
     zcode_out: Path,
+    qoder_out: Path,
 ) -> None:
     servers = merge_mcp_servers(root)
     if not servers:
         raise SystemExit(
             "No MCP configs found. Add .agents/mcp.json or another agent MCP file "
-            "(.mcp.json, .cursor/mcp.json, .codex/config.toml, .zcode/config.json)."
+            "(.mcp.json, .cursor/mcp.json, .codex/config.toml, .zcode/config.json, "
+            ".qoder/settings.json)."
         )
 
     data = {"mcpServers": servers}
+    qoder_servers = {name: qoder_server_from_canonical(cfg) for name, cfg in servers.items()}
 
     # Render everything before writing anything: a rejected source must leave
     # the existing outputs untouched rather than half-regenerated.
     rendered = [
         (source, render_json(data)),
-        (mcp_out, render_json(data)),
+        (mcp_out, render_json({"mcpServers": qoder_servers})),
         (cursor_out, render_cursor(data)),
         (codex_out, render_codex(servers)),
         (zcode_out, render_zcode_config(servers, zcode_out)),
+        (qoder_out, render_qoder_config(qoder_servers, qoder_out)),
     ]
 
     for path, content in rendered:
         write_text(path, content)
-        print(f"Generated {path.relative_to(root)}")
+        display_path = path.relative_to(root) if path.is_relative_to(root) else path
+        print(f"Generated {display_path}")
 
 
 def self_test() -> None:
@@ -580,7 +617,7 @@ def self_test() -> None:
     assert "${env:TOKEN}" not in copied
 
     with tempfile.TemporaryDirectory() as tmp:
-        root = Path(tmp)
+        root = Path(tmp).resolve()
         (root / ".cursor").mkdir()
         (root / ".cursor" / "mcp.json").write_text(
             json.dumps(
@@ -610,15 +647,130 @@ def self_test() -> None:
 
         (root / ".cursor" / "skills" / "demo-skill").mkdir(parents=True)
         (root / ".cursor" / "skills" / "demo-skill" / "SKILL.md").write_text("# demo\n", encoding="utf-8")
+        write_text(root / ".qoder" / "skills" / "qoder-skill" / "SKILL.md", "# qoder\n")
+        write_text(root / ".qoder" / "skills" / "shared-skill" / "SKILL.md", "# old\n")
+        write_text(root / ".agents" / "skills" / "shared-skill" / "SKILL.md", "# canonical\n")
         sync_skills(root)
         assert (root / ".agents" / "skills" / "demo-skill" / "SKILL.md").is_file()
         assert (root / ".cursor" / "skills" / "demo-skill").is_symlink()
+        qoder_skill = root / ".agents" / "skills" / "qoder-skill" / "SKILL.md"
+        assert qoder_skill.is_file(), "Qoder-only skills must be collected"
+        assert qoder_skill.read_text(encoding="utf-8") == "# qoder\n"
+        for rel in (*AGENT_SKILL_DIRS, ".qoder/skills"):
+            for name in ("demo-skill", "qoder-skill", "shared-skill"):
+                link = root / rel / name
+                assert link.is_symlink()
+                assert not Path(os.readlink(link)).is_absolute()
+                assert link.resolve() == (root / ".agents" / "skills" / name).resolve()
+        assert (root / ".qoder" / "skills" / "shared-skill" / "SKILL.md").read_text(encoding="utf-8") == "# canonical\n"
+        sync_skills(root)
+        assert qoder_skill.read_text(encoding="utf-8") == "# qoder\n"
 
         (root / "AGENTS.md").write_text("# rules\n", encoding="utf-8")
         (root / "CLAUDE.md").write_text("extra\n", encoding="utf-8")
         sync_agent_docs(root)
         assert "extra" in (root / "AGENTS.md").read_text(encoding="utf-8")
         assert (root / "CLAUDE.md").read_text(encoding="utf-8") == "@AGENTS.md\n"
+
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp)
+        settings = root / ".qoder" / "settings.json"
+        qoder_servers = {
+            "only-qoder": {"command": "qoder-only", "env": {"TOKEN": "${TOKEN}"}},
+            "shared": {"command": "qoder-shared"},
+        }
+        write_text(settings, render_json({"mcpServers": qoder_servers, "language": "Chinese"}))
+        assert merge_mcp_servers(root) == qoder_servers
+        write_text(root / ".zcode" / "config.json", render_json({
+            "mcp": {"servers": {"shared": {"command": "zcode-shared"}}},
+        }))
+        assert merge_mcp_servers(root)["shared"]["command"] == "qoder-shared"
+        write_text(root / ".mcp.json", render_json({
+            "mcpServers": {"shared": {"command": "claude-shared"}},
+        }))
+        assert merge_mcp_servers(root)["shared"]["command"] == "claude-shared"
+        assert merge_mcp_servers(root)["only-qoder"]["env"]["TOKEN"] == "${TOKEN}"
+
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp)
+        settings = root / ".qoder" / "settings.json"
+        write_text(settings, render_json({"language": "Chinese"}))
+        assert merge_mcp_servers(root) == {}
+        for invalid in ([], {"mcpServers": None}, {"mcpServers": []}, {"mcpServers": {"bad": "x"}}):
+            write_text(settings, json.dumps(invalid))
+            try:
+                merge_mcp_servers(root)
+            except SystemExit as exc:
+                assert str(settings) in str(exc)
+            else:
+                raise AssertionError("invalid Qoder MCP configuration must be rejected")
+
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp)
+        settings = root / ".qoder" / "settings.json"
+        write_text(settings, render_json({"language": "Chinese", "model": "keep-model"}))
+        source = root / ".agents" / "mcp.json"
+        write_text(source, render_json({"mcpServers": {
+            "remote": {
+                "type": "http", "url": "https://example.invalid/mcp",
+                "bearerTokenEnvVar": "TOKEN",
+                "headers": {"authorization": "Bearer ${OLD}", "X-Key": "${API_KEY}"},
+            },
+            "local": {"command": "demo", "args": ["${ARG}"], "env": {"TOKEN": "${TOKEN}"}},
+        }}))
+        command = [sys.executable, str(Path(__file__).resolve()), str(root), "--skip-skills", "--skip-docs"]
+        result = subprocess.run(command, capture_output=True, text=True)
+        assert result.returncode == 0, result.stderr
+        expected_servers = {
+            "remote": {
+                "type": "http", "url": "https://example.invalid/mcp",
+                "headers": {"Authorization": "Bearer ${TOKEN}", "X-Key": "${API_KEY}"},
+            },
+            "local": {"command": "demo", "args": ["${ARG}"], "env": {"TOKEN": "${TOKEN}"}},
+        }
+        actual = json.loads(settings.read_text(encoding="utf-8"))
+        assert actual.get("mcpServers") == expected_servers
+        assert actual["language"] == "Chinese" and actual["model"] == "keep-model"
+        assert json.loads((root / ".mcp.json").read_text(encoding="utf-8")) == {"mcpServers": expected_servers}
+        assert json.loads(source.read_text(encoding="utf-8"))["mcpServers"]["remote"]["bearerTokenEnvVar"] == "TOKEN"
+        assert not (root / ".qoder" / "skills").exists()
+        assert not (root / "AGENTS.md").exists()
+
+        paths = [source, settings, root / ".mcp.json", root / ".cursor" / "mcp.json",
+                 root / ".codex" / "config.toml", root / ".zcode" / "config.json"]
+        before = {path: path.read_bytes() for path in paths}
+        result = subprocess.run(command, capture_output=True, text=True)
+        assert result.returncode == 0, result.stderr
+        assert {path: path.read_bytes() for path in paths} == before
+
+        custom = root / "custom-qoder.json"
+        write_text(custom, render_json({"language": "English"}))
+        result = subprocess.run(command + ["--qoder-out", str(custom)], capture_output=True, text=True)
+        assert result.returncode == 0, result.stderr
+        assert json.loads(custom.read_text(encoding="utf-8")) == {
+            "language": "English", "mcpServers": expected_servers,
+        }
+
+        write_text(custom, "[]\n")
+        before = {path: path.read_bytes() for path in paths + [custom]}
+        result = subprocess.run(command + ["--qoder-out", str(custom)], capture_output=True, text=True)
+        assert result.returncode != 0
+        assert "must be a JSON object" in result.stderr
+        assert {path: path.read_bytes() for path in paths + [custom]} == before
+
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp) / "project"
+        write_text(root / ".mcp.json", render_json({"mcpServers": {"local": {"command": "demo"}}}))
+        custom = Path(tmp) / "qoder.json"
+        result = subprocess.run(
+            [sys.executable, str(Path(__file__).resolve()), str(root), "--qoder-out", str(custom),
+             "--skip-skills", "--skip-docs"], capture_output=True, text=True,
+        )
+        assert result.returncode == 0, result.stderr
+        assert json.loads(custom.read_text(encoding="utf-8")) == {
+            "mcpServers": {"local": {"command": "demo"}},
+        }
+        assert not (root / ".qoder" / "settings.json").exists()
 
     print("self-test ok")
 
@@ -642,6 +794,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--codex-out", type=Path)
     parser.add_argument("--mcp-out", type=Path)
     parser.add_argument("--zcode-out", type=Path)
+    parser.add_argument("--qoder-out", type=Path)
     parser.add_argument("--skip-skills", action="store_true")
     parser.add_argument("--skip-docs", action="store_true")
     parser.add_argument("--self-test", action="store_true")
@@ -663,8 +816,9 @@ def main() -> None:
     codex_out = (args.codex_out or root / ".codex" / "config.toml").resolve()
     mcp_out = (args.mcp_out or root / ".mcp.json").resolve()
     zcode_out = (args.zcode_out or root / ".zcode" / "config.json").resolve()
+    qoder_out = (args.qoder_out or root / ".qoder" / "settings.json").resolve()
 
-    sync_mcp(root, source, cursor_out, codex_out, mcp_out, zcode_out)
+    sync_mcp(root, source, cursor_out, codex_out, mcp_out, zcode_out, qoder_out)
     if not args.skip_skills:
         sync_skills(root)
     if not args.skip_docs:
