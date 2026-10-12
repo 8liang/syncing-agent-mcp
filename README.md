@@ -72,7 +72,7 @@ MCP 校验失败时不会部分写盘；任意位置都没有 MCP 配置时会�
 ## Antigravity
 
 - **工作区 MCP**：自动加载 `.agents/mcp_config.json` 的 `mcpServers`（只更新该键，保留其它顶层键）。远程 server 的 `url` 转成 `serverUrl`，并去掉 `type` 字段（Antigravity 不接受）。
-- **认证**：与 Qoder 相同，`bearerTokenEnvVar` 转成 `Authorization: Bearer ${VAR}` 头，显式变量优先于已有 Authorization 头。但 Antigravity **不展开** `${VAR}`，占位符按字面量发送；脚本会在 stderr 告警，需要鉴权时在 `.agents/mcp_config.json` 里填真实值或用包装命令。
+- **认证**：与 Qoder 相同，`bearerTokenEnvVar` 转成 `Authorization: Bearer ${VAR}` 头，显式变量优先于已有 Authorization 头。但 Antigravity **不展开** `${VAR}` 占位符，脚本会向 stderr 告警。需要认证的远程 server（如 `fns`）：在源配置（`.agents/mcp.json`）里配置真实凭据（勿提交敏感值），或改用包装脚本（以 stdio 命令运行，运行期读取环境变量并注入凭据）。只改生成的 `.agents/mcp_config.json` 不可靠——同名 server 会在下次同步被源覆盖（仅 Antigravity 独有的 server 可保留）。
 - **共用**：skills 直接使用 `.agents/skills/`（Antigravity 原生读取，无需 symlink 层），指引直接使用 `AGENTS.md`。
 - 不读取或改写全局 `~/.gemini/config/mcp_config.json`；如需把项目配置写到全局，可 `--antigravity-out` 指向该路径（整体覆盖其 `mcpServers`）。
 

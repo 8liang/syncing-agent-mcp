@@ -341,9 +341,10 @@ def render_antigravity_config(servers: dict, existing: Path) -> str:
     rendered = render_json(data)
     if "${" in rendered:
         print(
-            f"{existing}: Antigravity does not expand ${{VAR}}; placeholders are "
-            "sent literally. Use real values (or a wrapper command) where "
-            "authentication is required.",
+            f"{existing}: Antigravity does not expand ${{VAR}} — placeholders are "
+            "sent literally. For authenticated servers, put real values in the "
+            "source configs (or use a wrapper command); this generated file is "
+            "rebuilt on every sync.",
             file=sys.stderr,
         )
     return rendered

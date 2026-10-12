@@ -92,7 +92,7 @@ python3 scripts/sync_agent_config.py /absolute/path/to/project
 ## Antigravity
 
 - **工作区 MCP**：自动加载工作区 `.agents/mcp_config.json`（全局 `~/.gemini/config/mcp_config.json` 不在范围内）。脚本只更新 `mcpServers`，保留其它顶层键；远程 server 的 `url` 转为 `serverUrl`，`type` 字段一律移除（Antigravity 不接受）。
-- **认证**：`bearerTokenEnvVar` 转成 `Authorization: Bearer ${VAR}` 头并移除该扩展字段（与 Qoder 相同，显式变量优先于已有 Authorization 头）。但 Antigravity 不展开 `${VAR}`，占位符按字面量发送，脚本会向 stderr 告警：需要鉴权时在 `.agents/mcp_config.json` 中填真实值，或用包装命令自行注入。
+- **认证**：`bearerTokenEnvVar` 转成 `Authorization: Bearer ${VAR}` 头并移除该扩展字段（与 Qoder 相同，显式变量优先于已有 Authorization 头）。注意 Antigravity 原生不支持展开 `${VAR}` 占位符，脚本会向 stderr 告警。需要认证的远程 server（如 `fns`）请在源配置（`.agents/mcp.json`）中配置真实凭据（勿提交敏感值），或改用包装脚本（作为 stdio 命令运行，运行期读取环境变量并注入凭据）。只改生成的 `.agents/mcp_config.json` 不可靠——同名 server 下次同步会被源覆盖，仅 Antigravity 独有的 server 可保留。
 - **合并细节**：`.agents/mcp_config.json` 在 `.agents/mcp.json` 之前读取，同名 server 以 `.agents/mcp.json` 为准。Antigravity 界面上新增的 server 仅在 canonical 无同名时被收编。
 - **Skills / 指引**：Antigravity 原生读取工作区 `.agents/skills/`（无需 symlink 层），指引直接使用 `AGENTS.md`。
 
@@ -134,6 +134,7 @@ Codex **不会**展开 `http_headers` 里的 `${VAR}`。在 `.agents/mcp.json` �
 - 指望 Codex 在 `http_headers` 里展开 `${API_KEY}`
 - 指望 Antigravity 展开 `.agents/mcp_config.json` 里的 `${VAR}`（不会展开，按字面量发送）
 - 手改 `.agents/mcp_config.json` 当源（同名 server 会被 `.agents/mcp.json` 覆盖）
+- 把真实凭据只填进生成的 `.agents/mcp_config.json`（同名 server 下次同步会被源覆盖）
 - 把 Qoder CLI 配置文件误当作已验证的 IDE 自动加载入口
 - 只在 `.cursor/skills` 下维护 skill 却不跑 sync（规范目录是 `.agents/skills`）
 - 把长规则写在 `CLAUDE.md` 而不是 `AGENTS.md`
