@@ -92,7 +92,19 @@ python3 scripts/sync_agent_config.py /absolute/path/to/project
 ## Antigravity
 
 - **工作区 MCP**：自动加载工作区 `.agents/mcp_config.json`（全局 `~/.gemini/config/mcp_config.json` 不在范围内）。脚本只更新 `mcpServers`，保留其它顶层键；远程 server 的 `url` 转为 `serverUrl`，`type` 字段一律移除（Antigravity 不接受）。
-- **认证**：`bearerTokenEnvVar` 转成 `Authorization: Bearer ${VAR}` 头并移除该扩展字段（与 Qoder 相同，显式变量优先于已有 Authorization 头）。注意 Antigravity 原生不支持展开 `${VAR}` 占位符，脚本会向 stderr 告警。需要认证的远程 server（如 `fns`）请在源配置（`.agents/mcp.json`）中配置真实凭据（勿提交敏感值），或改用包装脚本（作为 stdio 命令运行，运行期读取环境变量并注入凭据）。只改生成的 `.agents/mcp_config.json` 不可靠——同名 server 下次同步会被源覆盖，仅 Antigravity 独有的 server 可保留。
+- **认证**：`bearerTokenEnvVar` 转成 `Authorization: Bearer ${VAR}` 头并移除该扩展字段（与 Qoder 相同，显式变量优先于已有 Authorization 头）。注意 Antigravity 原生不支持展开 `${VAR}` 占位符，脚本会向 stderr 告警。需要认证的远程 server（如 `fns`）两种做法，均改源文件 `.agents/mcp.json`（只改生成文件会在下次同步被覆盖）：
+  1. 源配置里配置真实凭据（勿提交敏感值）。
+  2. **桥接模式（推荐，密钥不进配置文件）**：装桥工具（`pnpm add -g mcp-remote`），写一个运行期读取环境变量的桥脚本：
+
+     ```sh
+     #!/bin/zsh   # 例：~/.local/bin/fns-mcp-bridge
+     emulate -L zsh
+     source "$HOME/.zshenv"                     # FNS_API_KEY 定义处
+     exec mcp-remote https://fns.example.com/api/mcp \
+       --header "Authorization: Bearer $FNS_API_KEY"
+     ```
+
+     源配置改为 `{"type": "stdio", "command": "/Users/you/.local/bin/fns-mcp-bridge"}`。stdio 的绝对路径/env.PATH 适配由本工具自动补齐，所有 agent 共用同一桥。
 - **启动适配**：Antigravity 从 GUI 启动 MCP server，不继承 shell PATH 且工作目录是程序目录——裸 `command`（如 `npx`、`codegraph`）会启动失败。脚本生成时会自动把裸命令解析为绝对路径（解析失败 stderr 告警），并为 stdio server 补充 `env.PATH`（取同步时的 shell PATH）。读回该文件时自动还原，不影响规范源与其它端输出。
 - **生效与验证**：以项目根为工作区打开 → 重启 Antigravity / 重载窗口（配置在启动时发现，工作区需已信任）→ MCP Servers 面板核对列表，可点 “View raw config” 对照；列表为空时先查是否打开了正确的工作区根目录。
 - **合并细节**：`.agents/mcp_config.json` 在 `.agents/mcp.json` 之前读取，同名 server 以 `.agents/mcp.json` 为准。Antigravity 界面上新增的 server 仅在 canonical 无同名时被收编。
