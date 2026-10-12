@@ -27,6 +27,7 @@ AGENT_SKILL_DIRS = (
     ".qoder/skills",
 )
 CANONICAL_SKILLS = Path(".agents/skills")
+BRIDGE_SCRIPT = Path(__file__).resolve().parent / "mcp_stdio_bridge"
 
 
 def q(value: object) -> str:
@@ -231,16 +232,37 @@ def antigravity_server_to_canonical(cfg: dict) -> dict:
         out["url"] = out.pop("serverUrl")
     if "url" in out and "type" not in out:
         out["type"] = "http"
-    if "command" in out and "type" not in out:
-        out["type"] = "stdio"
-    # Reverse the render-time adaptations so the file round-trips cleanly:
-    # an absolute command that matches its bare name stays portable, and the
-    # injected PATH (identical to ours) is dropped again.
+    # Reverse the render-time adaptations so the file round-trips cleanly.
     command = out.get("command")
-    if isinstance(command, str) and os.path.isabs(command):
-        base = os.path.basename(command)
-        if base and shutil.which(base) == command:
-            out["command"] = base
+    args = out.get("args")
+    if (
+        isinstance(command, str)
+        and os.path.basename(command) == BRIDGE_SCRIPT.name
+        and isinstance(args, list)
+        and args
+        and isinstance(args[0], str)
+        and args[0].startswith(("http://", "https://"))
+    ):
+        # Bridged HTTP server: rebuild the portable HTTP form.
+        out["url"] = args[0]
+        out["type"] = "http"
+        headers = {}
+        for item in args[1:]:
+            if isinstance(item, str) and ": " in item:
+                key, value = item.split(": ", 1)
+                headers[key] = value
+        if headers:
+            out["headers"] = headers
+        del out["command"]
+        del out["args"]
+    elif isinstance(command, str):
+        if "type" not in out:
+            out["type"] = "stdio"
+        # An absolute command that matches its bare name stays portable.
+        if os.path.isabs(command):
+            base = os.path.basename(command)
+            if base and shutil.which(base) == command:
+                out["command"] = base
     env = out.get("env")
     if isinstance(env, dict) and env.get("PATH") == os.environ.get("PATH"):
         remaining = {key: value for key, value in env.items() if key != "PATH"}
@@ -351,6 +373,35 @@ def antigravity_server_from_canonical(name: str, cfg: dict) -> dict:
                 f"{command!r} on PATH; the server may fail to start",
                 file=sys.stderr,
             )
+    headers = dict(out.get("headers") or {})
+    if bearer:
+        headers = {key: value for key, value in headers.items()
+                   if key.lower() != "authorization"}
+        headers["Authorization"] = f"Bearer ${{{bearer}}}"
+    if headers:
+        out["headers"] = headers
+    elif "headers" in out:
+        del out["headers"]
+
+    # Antigravity does not expand ${VAR} in HTTP headers: bridge authenticated
+    # servers to stdio through the bundled mcp_stdio_bridge, which expands the
+    # header templates at runtime. The loader rebuilds the HTTP form on re-read.
+    if (
+        "serverUrl" in out
+        and any(isinstance(value, str) and "${" in value for value in headers.values())
+        and BRIDGE_SCRIPT.is_file()
+    ):
+        args = [out.pop("serverUrl")]
+        args.extend(f"{key}: {value}" for key, value in headers.items())
+        del out["headers"]
+        out["command"] = str(BRIDGE_SCRIPT)
+        out["args"] = args
+        print(
+            f"mcpServers.{name}: Antigravity bridges the authenticated HTTP "
+            "server to stdio via mcp_stdio_bridge",
+            file=sys.stderr,
+        )
+
     if "command" in out:
         env = dict(out.get("env") or {})
         shell_path = os.environ.get("PATH")
@@ -363,15 +414,6 @@ def antigravity_server_from_canonical(name: str, cfg: dict) -> dict:
             )
         if env:
             out["env"] = env
-    headers = dict(out.get("headers") or {})
-    if bearer:
-        headers = {key: value for key, value in headers.items()
-                   if key.lower() != "authorization"}
-        headers["Authorization"] = f"Bearer ${{{bearer}}}"
-    if headers:
-        out["headers"] = headers
-    elif "headers" in out:
-        del out["headers"]
     return out
 
 
@@ -385,7 +427,14 @@ def render_antigravity_config(servers: dict, existing: Path) -> str:
         name: antigravity_server_from_canonical(name, cfg) for name, cfg in servers.items()
     }
     rendered = render_json(data)
-    if "${" in rendered:
+
+    def unexpanded(server: dict) -> bool:
+        probe = dict(server)
+        if os.path.basename(str(probe.get("command", ""))) == BRIDGE_SCRIPT.name:
+            probe.pop("args", None)  # the bridge expands these at runtime
+        return "${" in json.dumps(probe, ensure_ascii=False)
+
+    if any(unexpanded(server) for server in data["mcpServers"].values()):
         print(
             f"{existing}: Antigravity does not expand ${{VAR}} — placeholders are "
             "sent literally. For authenticated servers, put real values in the "
@@ -393,6 +442,15 @@ def render_antigravity_config(servers: dict, existing: Path) -> str:
             "rebuilt on every sync.",
             file=sys.stderr,
         )
+    if (
+        BRIDGE_SCRIPT.is_file()
+        and not os.access(BRIDGE_SCRIPT, os.X_OK)
+        and any(
+            os.path.basename(str(server.get("command", ""))) == BRIDGE_SCRIPT.name
+            for server in data["mcpServers"].values()
+        )
+    ):
+        os.chmod(BRIDGE_SCRIPT, 0o755)
     return rendered
 
 
@@ -733,16 +791,39 @@ def self_test() -> None:
         "url": "https://sse.invalid", "type": "sse",
     }
 
-    # Canonical → Antigravity: url becomes serverUrl, type is dropped (Antigravity
-    # rejects it), bearerTokenEnvVar replaces any existing Authorization header.
-    assert antigravity_server_from_canonical("remote", {
+    # Canonical → Antigravity: url becomes serverUrl, type is dropped, and an
+    # authenticated HTTP server (${VAR} in headers) is bridged to stdio via the
+    # bundled mcp_stdio_bridge — Antigravity itself never expands ${VAR}.
+    bridged = antigravity_server_from_canonical("remote", {
         "type": "http", "url": "https://example.invalid/mcp",
         "bearerTokenEnvVar": "TOKEN",
         "headers": {"authorization": "Bearer ${OLD}", "X-Key": "${API_KEY}"},
-    }) == {
-        "serverUrl": "https://example.invalid/mcp",
+    })
+    assert bridged == {
+        "command": str(BRIDGE_SCRIPT),
+        "args": [
+            "https://example.invalid/mcp",
+            "X-Key: ${API_KEY}",
+            "Authorization: Bearer ${TOKEN}",
+        ],
+        "env": {"PATH": os.environ["PATH"]},
+    }
+    assert antigravity_server_to_canonical(bridged) == {
+        "url": "https://example.invalid/mcp", "type": "http",
         "headers": {"X-Key": "${API_KEY}", "Authorization": "Bearer ${TOKEN}"},
     }
+    # HTTP servers without placeholders stay direct — no bridge overhead.
+    assert antigravity_server_from_canonical("plain", {
+        "url": "https://plain.invalid/mcp", "headers": {"X": "static"},
+    }) == {"serverUrl": "https://plain.invalid/mcp", "headers": {"X": "static"}}
+
+    # The bundled bridge expands ${VAR} / ${env:VAR} at runtime.
+    expanded = subprocess.run(
+        [str(BRIDGE_SCRIPT), "--expand", "A ${BRIDGE_TEST} B ${env:BRIDGE_TEST}"],
+        capture_output=True, text=True, env={**os.environ, "BRIDGE_TEST": "zz"},
+    )
+    assert expanded.returncode == 0, expanded.stderr
+    assert expanded.stdout.strip() == "A zz B zz"
     # GUI launches do not inherit the shell PATH: bare commands are resolved to
     # absolute paths and stdio servers get env.PATH. The loader reverses both,
     # so the generated file round-trips without polluting the canonical sources.
@@ -926,14 +1007,20 @@ def self_test() -> None:
         antigravity_config = root / ".agents" / "mcp_config.json"
         assert json.loads(antigravity_config.read_text(encoding="utf-8")) == {"mcpServers": {
             "remote": {
-                "serverUrl": "https://example.invalid/mcp",
-                "headers": {"Authorization": "Bearer ${TOKEN}", "X-Key": "${API_KEY}"},
+                "command": str(BRIDGE_SCRIPT),
+                "args": [
+                    "https://example.invalid/mcp",
+                    "X-Key: ${API_KEY}",
+                    "Authorization: Bearer ${TOKEN}",
+                ],
+                "env": {"PATH": os.environ["PATH"]},
             },
             "local": {
                 "command": "demo", "args": ["${ARG}"],
                 "env": {"TOKEN": "${TOKEN}", "PATH": os.environ["PATH"]},
             },
         }}
+        # The leftover ${VAR} lives in the local server's env, so it still warns.
         assert "does not expand" in result.stderr
 
         paths = [source, settings, root / ".mcp.json", root / ".cursor" / "mcp.json",

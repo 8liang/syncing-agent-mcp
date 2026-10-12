@@ -72,17 +72,7 @@ MCP 校验失败时不会部分写盘；任意位置都没有 MCP 配置时会�
 ## Antigravity
 
 - **工作区 MCP**：自动加载 `.agents/mcp_config.json` 的 `mcpServers`（只更新该键，保留其它顶层键）。远程 server 的 `url` 转成 `serverUrl`，并去掉 `type` 字段（Antigravity 不接受）。
-- **认证**：与 Qoder 相同，`bearerTokenEnvVar` 转成 `Authorization: Bearer ${VAR}` 头，显式变量优先于已有 Authorization 头。但 Antigravity **不展开** `${VAR}` 占位符，脚本会向 stderr 告警。需要认证的远程 server（如 `fns`）两种做法（改源文件 `.agents/mcp.json`）：① 配置真实凭据（勿提交敏感值）；② **桥接模式（推荐，密钥不进配置文件）**：装 `mcp-remote`（`pnpm add -g mcp-remote`），写一个运行期读取环境变量的桥脚本作为 stdio 命令：
-
-  ```sh
-  #!/bin/zsh   # 例：~/.local/bin/fns-mcp-bridge
-  emulate -L zsh
-  source "$HOME/.zshenv"                     # FNS_API_KEY 定义处
-  exec mcp-remote https://fns.example.com/api/mcp \
-    --header "Authorization: Bearer $FNS_API_KEY"
-  ```
-
-  源配置改为 `{"type": "stdio", "command": "/Users/you/.local/bin/fns-mcp-bridge"}`。只改生成的 `.agents/mcp_config.json` 会在下次同步被源覆盖（仅 Antigravity 独有的 server 可保留）。
+- **认证**：与 Qoder 相同，`bearerTokenEnvVar` 转成 `Authorization: Bearer ${VAR}` 头，显式变量优先于已有 Authorization 头。Antigravity **不展开** `${VAR}`，但脚本内置**通用桥**：HTTP server 的 headers 含 `${VAR}` 时，Antigravity 输出自动转成 stdio 形态，经内置 `scripts/mcp_stdio_bridge` 在运行期从环境（`~/.config/mcp-bridge.env` → `~/.zshenv`）展开 `${VAR}`/`${env:VAR}` 后带真实请求头转发（需 `mcp-remote`：`pnpm add -g mcp-remote`，缺失回退 `npx`；桥为 zsh 脚本）。源配置保持远程形式，其它端与读回均不受影响。也可直接在源里配真实凭据（勿提交敏感值）。
 - **启动适配**：Antigravity 从 GUI 启动 MCP server，不继承 shell PATH 且工作目录是程序目录——裸 `command`（如 `npx`、`codegraph`）会启动失败。生成文件会自动把裸命令解析为绝对路径（解析失败会 stderr 告警），并为 stdio server 补充 `env.PATH`（取同步时的 shell PATH）；该文件被作为合并输入读回时这两项自动还原，不污染源与其它端。
 - **生效与验证**：以项目根为工作区打开 → 重启 Antigravity 或重载窗口（配置在启动时发现，工作区需已信任）→ 在 MCP Servers 面板核对列表，可点 “View raw config” 对照实际读到的内容。
 - **共用**：skills 直接使用 `.agents/skills/`（Antigravity 原生读取，无需 symlink 层），指引直接使用 `AGENTS.md`。

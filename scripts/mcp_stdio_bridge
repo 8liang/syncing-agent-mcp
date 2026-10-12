@@ -1,0 +1,60 @@
+#!/bin/zsh
+# Generic stdio ↔ HTTP bridge for MCP clients that cannot expand ${VAR}
+# (Antigravity renders authenticated HTTP servers as a stdio command pointing
+# here, passing the URL and "Header: value" templates as arguments).
+#
+# Usage: mcp_stdio_bridge <url> ["Header: value" ...]
+#        mcp_stdio_bridge --expand "string with ${VAR} or ${env:VAR}"
+#
+# Header values are expanded at runtime from the user environment, loaded from
+# ~/.config/mcp-bridge.env (optional) and ~/.zshenv. Needs mcp-remote on PATH
+# (`pnpm add -g mcp-remote`); falls back to `npx -y mcp-remote`.
+emulate -L zsh
+
+expand() {
+  local s=$1 out='' pre rest name
+  while [[ $s == *'${'* ]]; do
+    pre=${s%%'${'*}
+    rest=${s#*'${'}
+    if [[ $rest != *'}'* ]]; then
+      out="${out}${s}"
+      s=''
+      break
+    fi
+    name=${rest%%'}'*}
+    name=${name#env:}
+    out="${out}${pre}${(P)name}"
+    s=${rest#*'}'}
+  done
+  print -rn -- "${out}${s}"
+}
+
+if [[ "$1" == "--expand" ]]; then
+  expand "${2:?--expand needs a string}"
+  print
+  exit 0
+fi
+
+if (( $# < 1 )); then
+  print -u2 "usage: mcp_stdio_bridge <url> ['Header: value' ...]"
+  exit 2
+fi
+
+# Secrets usually live in shell profiles; load them without touching stdout
+# (stdout carries the MCP JSON-RPC stream).
+{
+  [[ -f "$HOME/.config/mcp-bridge.env" ]] && source "$HOME/.config/mcp-bridge.env"
+  [[ -f "$HOME/.zshenv" ]] && source "$HOME/.zshenv"
+} >&2
+
+url=$1
+shift
+typeset -a hdrs
+for item in "$@"; do
+  hdrs+=(--header "$(expand "$item")")
+done
+
+if command -v mcp-remote >/dev/null 2>&1; then
+  exec mcp-remote "$url" "${hdrs[@]}"
+fi
+exec npx -y mcp-remote "$url" "${hdrs[@]}"
