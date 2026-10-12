@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Sync MCP, skills, and agent instructions across Cursor, Claude, Codex, Zcode, and Qoder."""
+"""Sync MCP, skills, and agent instructions across Cursor, Claude, Codex, Zcode, Qoder, and Antigravity."""
 
 from __future__ import annotations
 
@@ -225,6 +225,22 @@ def load_mcp_json_servers(
     return out
 
 
+def antigravity_server_to_canonical(cfg: dict) -> dict:
+    out = deepcopy(cfg)
+    if "serverUrl" in out:
+        out["url"] = out.pop("serverUrl")
+    if "url" in out and "type" not in out:
+        out["type"] = "http"
+    if "command" in out and "type" not in out:
+        out["type"] = "stdio"
+    return out
+
+
+def load_antigravity_servers(path: Path) -> dict:
+    servers = load_mcp_json_servers(path, from_cursor=False)
+    return {name: antigravity_server_to_canonical(cfg) for name, cfg in servers.items()}
+
+
 def merge_mcp_servers(root: Path) -> dict[str, dict]:
     """Collect MCP servers from every agent config; later layers override name clashes."""
     layers: list[tuple[str, dict]] = [
@@ -235,6 +251,7 @@ def merge_mcp_servers(root: Path) -> dict[str, dict]:
         )),
         ("claude", load_mcp_json_servers(root / ".mcp.json", from_cursor=False)),
         ("cursor", load_mcp_json_servers(root / ".cursor" / "mcp.json", from_cursor=True)),
+        ("antigravity", load_antigravity_servers(root / ".agents" / "mcp_config.json")),
         ("agents", load_mcp_json_servers(root / ".agents" / "mcp.json", from_cursor=False)),
     ]
     merged: dict[str, dict] = {}
@@ -292,6 +309,44 @@ def render_qoder_config(servers: dict, existing: Path) -> str:
             raise SystemExit(f"{existing} must be a JSON object")
     data["mcpServers"] = servers
     return render_json(data)
+
+
+def antigravity_server_from_canonical(cfg: dict) -> dict:
+    out = deepcopy(cfg)
+    out.pop("type", None)
+    bearer = out.pop("bearerTokenEnvVar", None)
+    if "url" in out:
+        out["serverUrl"] = out.pop("url")
+    headers = dict(out.get("headers") or {})
+    if bearer:
+        headers = {key: value for key, value in headers.items()
+                   if key.lower() != "authorization"}
+        headers["Authorization"] = f"Bearer ${{{bearer}}}"
+    if headers:
+        out["headers"] = headers
+    elif "headers" in out:
+        del out["headers"]
+    return out
+
+
+def render_antigravity_config(servers: dict, existing: Path) -> str:
+    data: dict = {}
+    if existing.exists():
+        data = json.loads(existing.read_text(encoding="utf-8"))
+        if not isinstance(data, dict):
+            raise SystemExit(f"{existing} must be a JSON object")
+    data["mcpServers"] = {
+        name: antigravity_server_from_canonical(cfg) for name, cfg in servers.items()
+    }
+    rendered = render_json(data)
+    if "${" in rendered:
+        print(
+            f"{existing}: Antigravity does not expand ${{VAR}}; placeholders are "
+            "sent literally. Use real values (or a wrapper command) where "
+            "authentication is required.",
+            file=sys.stderr,
+        )
+    return rendered
 
 
 def render_codex(servers: dict) -> str:
@@ -465,13 +520,14 @@ def sync_mcp(
     mcp_out: Path,
     zcode_out: Path,
     qoder_out: Path,
+    antigravity_out: Path,
 ) -> None:
     servers = merge_mcp_servers(root)
     if not servers:
         raise SystemExit(
             "No MCP configs found. Add .agents/mcp.json or another agent MCP file "
             "(.mcp.json, .cursor/mcp.json, .codex/config.toml, .zcode/config.json, "
-            ".qoder/settings.json)."
+            ".qoder/settings.json, .agents/mcp_config.json)."
         )
 
     data = {"mcpServers": servers}
@@ -486,6 +542,7 @@ def sync_mcp(
         (codex_out, render_codex(servers)),
         (zcode_out, render_zcode_config(servers, zcode_out)),
         (qoder_out, render_qoder_config(qoder_servers, qoder_out)),
+        (antigravity_out, render_antigravity_config(servers, antigravity_out)),
     ]
 
     for path, content in rendered:
@@ -616,6 +673,50 @@ def self_test() -> None:
     assert "${TOKEN}" in copied
     assert "${env:TOKEN}" not in copied
 
+    # Antigravity uses serverUrl and infers the transport type; the input stays untouched.
+    antigravity_source = {"serverUrl": "https://example.invalid/mcp", "headers": {"X": "1"}}
+    assert antigravity_server_to_canonical(antigravity_source) == {
+        "url": "https://example.invalid/mcp", "type": "http", "headers": {"X": "1"},
+    }
+    assert antigravity_source == {"serverUrl": "https://example.invalid/mcp", "headers": {"X": "1"}}
+    assert antigravity_server_to_canonical({"command": "demo", "args": ["x"]}) == {
+        "command": "demo", "args": ["x"], "type": "stdio",
+    }
+    assert antigravity_server_to_canonical({"url": "https://sse.invalid", "type": "sse"}) == {
+        "url": "https://sse.invalid", "type": "sse",
+    }
+
+    # Canonical → Antigravity: url becomes serverUrl, type is dropped (Antigravity
+    # rejects it), bearerTokenEnvVar replaces any existing Authorization header.
+    assert antigravity_server_from_canonical({
+        "type": "http", "url": "https://example.invalid/mcp",
+        "bearerTokenEnvVar": "TOKEN",
+        "headers": {"authorization": "Bearer ${OLD}", "X-Key": "${API_KEY}"},
+    }) == {
+        "serverUrl": "https://example.invalid/mcp",
+        "headers": {"X-Key": "${API_KEY}", "Authorization": "Bearer ${TOKEN}"},
+    }
+    assert antigravity_server_from_canonical(
+        {"command": "demo", "type": "stdio", "headers": {}}
+    ) == {"command": "demo"}
+
+    with tempfile.TemporaryDirectory() as tmp:
+        existing = Path(tmp) / "mcp_config.json"
+        write_text(existing, render_json(
+            {"mcpServers": {"old": {"command": "old"}}, "note": "keep"}
+        ))
+        rendered = json.loads(render_antigravity_config(
+            {"demo": {"command": "demo", "type": "stdio"}}, existing
+        ))
+        assert rendered == {"note": "keep", "mcpServers": {"demo": {"command": "demo"}}}
+        write_text(existing, "[]\n")
+        try:
+            render_antigravity_config({}, existing)
+        except SystemExit as exc:
+            assert "must be a JSON object" in str(exc)
+        else:
+            raise AssertionError("invalid Antigravity config must be rejected")
+
     with tempfile.TemporaryDirectory() as tmp:
         root = Path(tmp).resolve()
         (root / ".cursor").mkdir()
@@ -707,6 +808,33 @@ def self_test() -> None:
 
     with tempfile.TemporaryDirectory() as tmp:
         root = Path(tmp)
+        config = root / ".agents" / "mcp_config.json"
+        write_text(config, render_json({"mcpServers": {
+            "only-antigravity": {"serverUrl": "https://antigravity.invalid/mcp"},
+            "shared": {"command": "antigravity-shared"},
+        }}))
+        merged = merge_mcp_servers(root)
+        assert merged["only-antigravity"] == {"url": "https://antigravity.invalid/mcp", "type": "http"}
+        assert merged["shared"]["command"] == "antigravity-shared"
+        write_text(root / ".cursor" / "mcp.json", render_json({
+            "mcpServers": {"shared": {"command": "cursor-shared"}},
+        }))
+        assert merge_mcp_servers(root)["shared"]["command"] == "antigravity-shared"
+        write_text(root / ".agents" / "mcp.json", render_json({
+            "mcpServers": {"shared": {"command": "canonical-shared"}},
+        }))
+        assert merge_mcp_servers(root)["shared"]["command"] == "canonical-shared"
+        for invalid in ([], {"mcpServers": None}, {"mcpServers": []}, {"mcpServers": {"bad": "x"}}):
+            write_text(config, json.dumps(invalid))
+            try:
+                merge_mcp_servers(root)
+            except SystemExit as exc:
+                assert str(config) in str(exc)
+            else:
+                raise AssertionError("invalid Antigravity MCP configuration must be rejected")
+
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp)
         settings = root / ".qoder" / "settings.json"
         write_text(settings, render_json({"language": "Chinese", "model": "keep-model"}))
         source = root / ".agents" / "mcp.json"
@@ -736,8 +864,19 @@ def self_test() -> None:
         assert not (root / ".qoder" / "skills").exists()
         assert not (root / "AGENTS.md").exists()
 
+        antigravity_config = root / ".agents" / "mcp_config.json"
+        assert json.loads(antigravity_config.read_text(encoding="utf-8")) == {"mcpServers": {
+            "remote": {
+                "serverUrl": "https://example.invalid/mcp",
+                "headers": {"Authorization": "Bearer ${TOKEN}", "X-Key": "${API_KEY}"},
+            },
+            "local": {"command": "demo", "args": ["${ARG}"], "env": {"TOKEN": "${TOKEN}"}},
+        }}
+        assert "does not expand" in result.stderr
+
         paths = [source, settings, root / ".mcp.json", root / ".cursor" / "mcp.json",
-                 root / ".codex" / "config.toml", root / ".zcode" / "config.json"]
+                 root / ".codex" / "config.toml", root / ".zcode" / "config.json",
+                 antigravity_config]
         before = {path: path.read_bytes() for path in paths}
         result = subprocess.run(command, capture_output=True, text=True)
         assert result.returncode == 0, result.stderr
@@ -772,6 +911,23 @@ def self_test() -> None:
         }
         assert not (root / ".qoder" / "settings.json").exists()
 
+        antigravity_custom = Path(tmp) / "antigravity.json"
+        antigravity_command = [
+            sys.executable, str(Path(__file__).resolve()), str(root),
+            "--antigravity-out", str(antigravity_custom), "--skip-skills", "--skip-docs",
+        ]
+        result = subprocess.run(antigravity_command, capture_output=True, text=True)
+        assert result.returncode == 0, result.stderr
+        assert json.loads(antigravity_custom.read_text(encoding="utf-8")) == {
+            "mcpServers": {"local": {"command": "demo"}},
+        }
+        write_text(antigravity_custom, "[]\n")
+        before_bytes = antigravity_custom.read_bytes()
+        result = subprocess.run(antigravity_command, capture_output=True, text=True)
+        assert result.returncode != 0
+        assert "must be a JSON object" in result.stderr
+        assert antigravity_custom.read_bytes() == before_bytes
+
     print("self-test ok")
 
 
@@ -795,6 +951,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--mcp-out", type=Path)
     parser.add_argument("--zcode-out", type=Path)
     parser.add_argument("--qoder-out", type=Path)
+    parser.add_argument("--antigravity-out", type=Path)
     parser.add_argument("--skip-skills", action="store_true")
     parser.add_argument("--skip-docs", action="store_true")
     parser.add_argument("--self-test", action="store_true")
@@ -817,8 +974,9 @@ def main() -> None:
     mcp_out = (args.mcp_out or root / ".mcp.json").resolve()
     zcode_out = (args.zcode_out or root / ".zcode" / "config.json").resolve()
     qoder_out = (args.qoder_out or root / ".qoder" / "settings.json").resolve()
+    antigravity_out = (args.antigravity_out or root / ".agents" / "mcp_config.json").resolve()
 
-    sync_mcp(root, source, cursor_out, codex_out, mcp_out, zcode_out, qoder_out)
+    sync_mcp(root, source, cursor_out, codex_out, mcp_out, zcode_out, qoder_out, antigravity_out)
     if not args.skip_skills:
         sync_skills(root)
     if not args.skip_docs:

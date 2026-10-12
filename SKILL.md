@@ -1,11 +1,11 @@
 ---
 name: syncing-agent-mcp
-description: 当 Cursor、Claude Code、Codex、Zcode、Qoder CLI / IDE 的 MCP、项目 skills、AGENTS.md 需要对齐，或 `.agents/mcp.json`、`.mcp.json`、`.cursor/mcp.json`、`.codex/config.toml`、`.zcode/config.json`、`.qoder/settings.json` 漂移时使用；也适用于 `${VAR}` / `${env:VAR}`、Codex http_headers 未展开导致 not logged in，以及 Qoder IDE 手动导入 MCP 的场景。
+description: 当 Cursor、Claude Code、Codex、Zcode、Qoder CLI / IDE、Antigravity 的 MCP、项目 skills、AGENTS.md 需要对齐，或 `.agents/mcp.json`、`.mcp.json`、`.cursor/mcp.json`、`.codex/config.toml`、`.zcode/config.json`、`.qoder/settings.json`、`.agents/mcp_config.json` 漂移时使用；也适用于 `${VAR}` / `${env:VAR}`、Codex http_headers 未展开导致 not logged in、Antigravity 不展开 `${VAR}`，以及 Qoder IDE 手动导入 MCP 的场景。
 ---
 
 # Syncing Agent MCP
 
-在同一份项目里对齐 Cursor、Claude Code、Codex、Zcode、Qoder 的 MCP、Skills 与开发指引（Qoder CLI 自动同步，IDE 的 MCP 手动导入）。对**项目根目录**运行本 skill 自带的脚本。不要把脚本拷进业务仓库，不要手改生成的 JSON / TOML。
+在同一份项目里对齐 Cursor、Claude Code、Codex、Zcode、Qoder 与 Antigravity 的 MCP、Skills 与开发指引（Qoder CLI 自动同步，其 IDE 的 MCP 手动导入；Antigravity 自动加载工作区配置）。对**项目根目录**运行本 skill 自带的脚本。不要把脚本拷进业务仓库，不要手改生成的 JSON / TOML。
 
 ## 布局
 
@@ -17,11 +17,12 @@ description: 当 Cursor、Claude Code、Codex、Zcode、Qoder CLI / IDE 的 MCP�
 | Codex | `.codex/config.toml` | 认证走 `bearerTokenEnvVar` / `env_http_headers` |
 | Zcode | `.zcode/config.json` | 只更新 `mcp.servers`，其它键保留 |
 | Qoder CLI | `.qoder/settings.json` | 只更新 `mcpServers`，其它设置保留 |
-| Skills 源 | `.agents/skills/` | 各端 `*/skills/`（含 `.qoder/skills/`）通过 symlink 指向这里 |
+| Antigravity | `.agents/mcp_config.json` | 只更新 `mcpServers`，其它键保留；`url` → `serverUrl`，去 `type`，不展开 `${VAR}` |
+| Skills 源 | `.agents/skills/` | 各端 `*/skills/`（含 `.qoder/skills/`）通过 symlink 指向这里，Antigravity 原生读取 |
 | 开发指引 | `AGENTS.md` | 权威正文 |
 | Claude | `CLAUDE.md` | 固定为 `@AGENTS.md` |
 
-Cursor、Codex 与 Qoder（CLI / IDE）直接读项目根下的 `AGENTS.md`，无需生成 `QODER.md`。
+Cursor、Codex、Qoder（CLI / IDE）与 Antigravity 直接读项目根下的 `AGENTS.md`，无需生成 `QODER.md`。
 
 ## 安装（每台机器一次）
 
@@ -51,7 +52,7 @@ python3 scripts/sync_agent_config.py /absolute/path/to/project
 
 脚本**依次**执行：
 
-1. **MCP**：读取 `.codex/config.toml`、`.zcode/config.json`、`.qoder/settings.json`、`.mcp.json`、`.cursor/mcp.json`、`.agents/mcp.json`，按 server 名合并（后者覆盖前者，`.agents/mcp.json` 优先级最高），写回 `.agents/mcp.json` 并生成各端文件。
+1. **MCP**：读取 `.codex/config.toml`、`.zcode/config.json`、`.qoder/settings.json`、`.mcp.json`、`.cursor/mcp.json`、`.agents/mcp_config.json`、`.agents/mcp.json`，按 server 名合并（后者覆盖前者，`.agents/mcp.json` 优先级最高），写回 `.agents/mcp.json` 并生成各端文件。
 2. **Skills**：把各端 `*/skills/<name>/`（须含 `SKILL.md`）收拢到 `.agents/skills/`，再在各端建立指向 `.agents/skills/<name>` 的 symlink。
 3. **指引**：把 `AGENTS.md` 与 `CLAUDE.md` 中非 `@AGENTS.md` 的正文合并进 `AGENTS.md`，并将 `CLAUDE.md` 设为 `@AGENTS.md`。
 
@@ -62,7 +63,7 @@ python3 scripts/sync_agent_config.py /absolute/path/to/project
 | `--skip-skills` | 跳过 skills 同步；只跑 MCP 时同时传 `--skip-docs` |
 | `--skip-docs` | 跳过 AGENTS/CLAUDE |
 | `--self-test` | 运行内置测试（无需项目路径） |
-| `--source`、`--cursor-out`、`--codex-out`、`--mcp-out`、`--zcode-out`、`--qoder-out` | 覆盖输出路径（高级），不改变输入发现路径 |
+| `--source`、`--cursor-out`、`--codex-out`、`--mcp-out`、`--zcode-out`、`--qoder-out`、`--antigravity-out` | 覆盖输出路径（高级），不改变输入发现路径 |
 
 任意位置都没有 MCP 配置时会报错退出，不会写入空配置。MCP 渲染校验失败时不会部分写盘（全部渲染完成后再写入）。
 
@@ -75,7 +76,8 @@ python3 scripts/sync_agent_config.py /absolute/path/to/project
 3. `.qoder/settings.json`（没有 `mcpServers` 时跳过）
 4. `.mcp.json`
 5. `.cursor/mcp.json`（规范 JSON 中 `${env:VAR}` → `${VAR}`）
-6. `.agents/mcp.json`
+6. `.agents/mcp_config.json`（`serverUrl` → `url`，补 `type`）
+7. `.agents/mcp.json`
 
 ## Qoder CLI / IDE
 
@@ -86,6 +88,15 @@ python3 scripts/sync_agent_config.py /absolute/path/to/project
 - 不读取或改写用户级 Qoder 配置及 `.qoder/settings.local.json`；本地覆盖和项目 MCP 审批仍由 Qoder 管理。
 
 依据：[CLI MCP](https://docs.qoder.com/cli/mcp-reference.md)、[IDE MCP](https://docs.qoder.com/user-guide/chat/model-context-protocol.md)。
+
+## Antigravity
+
+- **工作区 MCP**：自动加载工作区 `.agents/mcp_config.json`（全局 `~/.gemini/config/mcp_config.json` 不在范围内）。脚本只更新 `mcpServers`，保留其它顶层键；远程 server 的 `url` 转为 `serverUrl`，`type` 字段一律移除（Antigravity 不接受）。
+- **认证**：`bearerTokenEnvVar` 转成 `Authorization: Bearer ${VAR}` 头并移除该扩展字段（与 Qoder 相同，显式变量优先于已有 Authorization 头）。但 Antigravity 不展开 `${VAR}`，占位符按字面量发送，脚本会向 stderr 告警：需要鉴权时在 `.agents/mcp_config.json` 中填真实值，或用包装命令自行注入。
+- **合并细节**：`.agents/mcp_config.json` 在 `.agents/mcp.json` 之前读取，同名 server 以 `.agents/mcp.json` 为准。Antigravity 界面上新增的 server 仅在 canonical 无同名时被收编。
+- **Skills / 指引**：Antigravity 原生读取工作区 `.agents/skills/`（无需 symlink 层），指引直接使用 `AGENTS.md`。
+
+依据：[MCP](https://antigravity.google/docs/mcp/)、[Skills](https://antigravity.google/docs/skills/)、[Rules](https://antigravity.google/docs/rules/)。
 
 ## Codex 认证
 
@@ -118,9 +129,11 @@ Codex **不会**展开 `http_headers` 里的 `${VAR}`。在 `.agents/mcp.json` �
 ## 常见错误
 
 - 把转换脚本拷进业务仓库
-- 手改生成的 `.mcp.json`、`.cursor/mcp.json`、`.codex/config.toml`、`.zcode/config.json`、`.qoder/settings.json` 中的 MCP 当作源
+- 手改生成的 `.mcp.json`、`.cursor/mcp.json`、`.codex/config.toml`、`.zcode/config.json`、`.qoder/settings.json`、`.agents/mcp_config.json` 中的 MCP 当作源
 - 在 Cursor 生成文件里手写 `${API_KEY}`（源文件 `.agents/mcp.json` 用 `${API_KEY}`，生成结果为 `${env:API_KEY}`）
 - 指望 Codex 在 `http_headers` 里展开 `${API_KEY}`
+- 指望 Antigravity 展开 `.agents/mcp_config.json` 里的 `${VAR}`（不会展开，按字面量发送）
+- 手改 `.agents/mcp_config.json` 当源（同名 server 会被 `.agents/mcp.json` 覆盖）
 - 把 Qoder CLI 配置文件误当作已验证的 IDE 自动加载入口
 - 只在 `.cursor/skills` 下维护 skill 却不跑 sync（规范目录是 `.agents/skills`）
 - 把长规则写在 `CLAUDE.md` 而不是 `AGENTS.md`
