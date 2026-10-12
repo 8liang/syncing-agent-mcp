@@ -233,6 +233,21 @@ def antigravity_server_to_canonical(cfg: dict) -> dict:
         out["type"] = "http"
     if "command" in out and "type" not in out:
         out["type"] = "stdio"
+    # Reverse the render-time adaptations so the file round-trips cleanly:
+    # an absolute command that matches its bare name stays portable, and the
+    # injected PATH (identical to ours) is dropped again.
+    command = out.get("command")
+    if isinstance(command, str) and os.path.isabs(command):
+        base = os.path.basename(command)
+        if base and shutil.which(base) == command:
+            out["command"] = base
+    env = out.get("env")
+    if isinstance(env, dict) and env.get("PATH") == os.environ.get("PATH"):
+        remaining = {key: value for key, value in env.items() if key != "PATH"}
+        if remaining:
+            out["env"] = remaining
+        else:
+            del out["env"]
     return out
 
 
@@ -311,12 +326,43 @@ def render_qoder_config(servers: dict, existing: Path) -> str:
     return render_json(data)
 
 
-def antigravity_server_from_canonical(cfg: dict) -> dict:
+def antigravity_server_from_canonical(name: str, cfg: dict) -> dict:
     out = deepcopy(cfg)
     out.pop("type", None)
     bearer = out.pop("bearerTokenEnvVar", None)
     if "url" in out:
         out["serverUrl"] = out.pop("url")
+    # Antigravity launches GUI-isolated processes: it does not inherit the
+    # shell PATH and the working directory is the app folder, so bare commands
+    # fail to start. Resolve them here; the loader reverses this on re-read.
+    command = out.get("command")
+    if isinstance(command, str) and "/" not in command:
+        resolved = shutil.which(command)
+        if resolved:
+            print(
+                f"mcpServers.{name}: Antigravity resolved command "
+                f"{command!r} → {resolved}",
+                file=sys.stderr,
+            )
+            out["command"] = resolved
+        else:
+            print(
+                f"mcpServers.{name}: Antigravity cannot resolve command "
+                f"{command!r} on PATH; the server may fail to start",
+                file=sys.stderr,
+            )
+    if "command" in out:
+        env = dict(out.get("env") or {})
+        shell_path = os.environ.get("PATH")
+        if shell_path and "PATH" not in env:
+            env["PATH"] = shell_path
+            print(
+                f"mcpServers.{name}: Antigravity stdio output gets env.PATH "
+                "(GUI launches do not inherit the shell PATH)",
+                file=sys.stderr,
+            )
+        if env:
+            out["env"] = env
     headers = dict(out.get("headers") or {})
     if bearer:
         headers = {key: value for key, value in headers.items()
@@ -336,7 +382,7 @@ def render_antigravity_config(servers: dict, existing: Path) -> str:
         if not isinstance(data, dict):
             raise SystemExit(f"{existing} must be a JSON object")
     data["mcpServers"] = {
-        name: antigravity_server_from_canonical(cfg) for name, cfg in servers.items()
+        name: antigravity_server_from_canonical(name, cfg) for name, cfg in servers.items()
     }
     rendered = render_json(data)
     if "${" in rendered:
@@ -689,7 +735,7 @@ def self_test() -> None:
 
     # Canonical → Antigravity: url becomes serverUrl, type is dropped (Antigravity
     # rejects it), bearerTokenEnvVar replaces any existing Authorization header.
-    assert antigravity_server_from_canonical({
+    assert antigravity_server_from_canonical("remote", {
         "type": "http", "url": "https://example.invalid/mcp",
         "bearerTokenEnvVar": "TOKEN",
         "headers": {"authorization": "Bearer ${OLD}", "X-Key": "${API_KEY}"},
@@ -697,9 +743,18 @@ def self_test() -> None:
         "serverUrl": "https://example.invalid/mcp",
         "headers": {"X-Key": "${API_KEY}", "Authorization": "Bearer ${TOKEN}"},
     }
+    # GUI launches do not inherit the shell PATH: bare commands are resolved to
+    # absolute paths and stdio servers get env.PATH. The loader reverses both,
+    # so the generated file round-trips without polluting the canonical sources.
     assert antigravity_server_from_canonical(
-        {"command": "demo", "type": "stdio", "headers": {}}
-    ) == {"command": "demo"}
+        "local", {"command": "demo", "type": "stdio", "headers": {}}
+    ) == {"command": "demo", "env": {"PATH": os.environ["PATH"]}}
+    enriched = antigravity_server_from_canonical("local", {"command": "sh", "type": "stdio"})
+    assert enriched == {"command": shutil.which("sh"), "env": {"PATH": os.environ["PATH"]}}
+    assert antigravity_server_to_canonical(enriched) == {"command": "sh", "type": "stdio"}
+    assert antigravity_server_to_canonical(
+        {"command": "x", "env": {"PATH": "/custom/bin"}}
+    ) == {"command": "x", "type": "stdio", "env": {"PATH": "/custom/bin"}}
 
     with tempfile.TemporaryDirectory() as tmp:
         existing = Path(tmp) / "mcp_config.json"
@@ -709,7 +764,10 @@ def self_test() -> None:
         rendered = json.loads(render_antigravity_config(
             {"demo": {"command": "demo", "type": "stdio"}}, existing
         ))
-        assert rendered == {"note": "keep", "mcpServers": {"demo": {"command": "demo"}}}
+        assert rendered == {
+            "note": "keep",
+            "mcpServers": {"demo": {"command": "demo", "env": {"PATH": os.environ["PATH"]}}},
+        }
         write_text(existing, "[]\n")
         try:
             render_antigravity_config({}, existing)
@@ -871,7 +929,10 @@ def self_test() -> None:
                 "serverUrl": "https://example.invalid/mcp",
                 "headers": {"Authorization": "Bearer ${TOKEN}", "X-Key": "${API_KEY}"},
             },
-            "local": {"command": "demo", "args": ["${ARG}"], "env": {"TOKEN": "${TOKEN}"}},
+            "local": {
+                "command": "demo", "args": ["${ARG}"],
+                "env": {"TOKEN": "${TOKEN}", "PATH": os.environ["PATH"]},
+            },
         }}
         assert "does not expand" in result.stderr
 
@@ -920,7 +981,7 @@ def self_test() -> None:
         result = subprocess.run(antigravity_command, capture_output=True, text=True)
         assert result.returncode == 0, result.stderr
         assert json.loads(antigravity_custom.read_text(encoding="utf-8")) == {
-            "mcpServers": {"local": {"command": "demo"}},
+            "mcpServers": {"local": {"command": "demo", "env": {"PATH": os.environ["PATH"]}}},
         }
         write_text(antigravity_custom, "[]\n")
         before_bytes = antigravity_custom.read_bytes()
