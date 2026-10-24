@@ -10,10 +10,10 @@
 | Claude / Qoder CLI | `.mcp.json` | 通用 MCP JSON；`bearerTokenEnvVar` 转为认证头，也供 IDE 手动导入 |
 | Cursor | `.cursor/mcp.json` | `${VAR}` → `${env:VAR}` |
 | Codex | `.codex/config.toml` | 认证走 `bearerTokenEnvVar` / `env_http_headers` |
-| Zcode | `.zcode/config.json` | 只更新 `mcp.servers`，其它键保留 |
+| Zcode | `.zcode/config.json` | 只更新 `mcp.servers`，其它键保留；认证 HTTP server 转 stdio bridge（Desktop 不展开 `${VAR}`） |
 | Qoder CLI | `.qoder/settings.json` | 只更新 `mcpServers`，其它设置保留 |
 | Antigravity | `.agents/mcp_config.json` | 只更新 `mcpServers`，其它键保留；`url` → `serverUrl`，去 `type` |
-| Skills 源 | `.agents/skills/` | 各端 skill 目录（含 `.qoder/skills/`）symlink 到这里，Antigravity 原生读取 |
+| Skills 源 | `.agents/skills/` | 各端 skills 目录（如 `.cursor/skills/` 等）整目录 symlink 到这里，Antigravity 原生读取 |
 | 开发指引 | `AGENTS.md` | 权威正文 |
 | Claude | `CLAUDE.md` | 固定为 `@AGENTS.md` |
 
@@ -44,7 +44,7 @@ python3 scripts/sync_agent_config.py /path/to/project
 脚本会依次：
 
 1. **MCP**：读取 `.codex/config.toml`、`.zcode/config.json`、`.qoder/settings.json`、`.mcp.json`、`.cursor/mcp.json`、`.agents/mcp_config.json`、`.agents/mcp.json`，按 server 名合并（后者覆盖前者，`.agents/mcp.json` 优先级最高），写回 `.agents/mcp.json` 并生成各端文件。
-2. **Skills**：把各端 `*/skills/<name>/` 收拢到 `.agents/skills/`，再在各端建立指向该目录的 symlink。
+2. **Skills**：把各端既有 skills 收拢到 `.agents/skills/`，再将各端 `*/skills` 目录整目录建立指向 `.agents/skills` 的相对 symlink。
 3. **指引**：把 `AGENTS.md` 与 `CLAUDE.md` 中非 `@AGENTS.md` 的正文合并进 `AGENTS.md`，并将 `CLAUDE.md` 设为 `@AGENTS.md`。
 
 可选：
@@ -64,7 +64,7 @@ MCP 校验失败时不会部分写盘；任意位置都没有 MCP 配置时会�
 - **CLI**：自动同步 `.qoder/settings.json` 的 `mcpServers`，保留其它设置；没有该字段的 settings 文件不提供 MCP 输入。CLI 优先读取的根目录 `.mcp.json` 也生成相同 MCP 内容。
 - **认证**：两处均将 `bearerTokenEnvVar` 转成 `Authorization: Bearer ${VAR}` 并移除扩展字段；显式变量优先于已有 Authorization 头（名称不区分大小写）。保留 `${VAR}` 占位符，不写入真实环境变量值，`.agents/mcp.json` 保留规范源字段。
 - **IDE**：在 Settings → MCP 的 JSON 配置入口合并生成的 `.mcp.json` 中的 `mcpServers`，保留已有其它服务器。官方文档尚未明确 IDE 项目级 MCP 自动加载路径，因此不生成 `.qoder/mcp.json`，不承诺自动加载 CLI 配置；IDE 的环境变量展开需另行核验。
-- **共用**：`.qoder/skills/<name>` 与其它端一样链接到 `.agents/skills/<name>`，指引直接使用 `AGENTS.md`。
+- **共用**：`.qoder/skills` 与其它端一样整目录链接到 `.agents/skills`，指引直接使用 `AGENTS.md`。
 - 不读取或改写用户级 Qoder 配置及 `.qoder/settings.local.json`；本地覆盖和项目 MCP 审批仍由 Qoder 管理。
 
 依据：[CLI MCP](https://docs.qoder.com/cli/mcp-reference.md)、[IDE MCP](https://docs.qoder.com/user-guide/chat/model-context-protocol.md)。
@@ -79,6 +79,14 @@ MCP 校验失败时不会部分写盘；任意位置都没有 MCP 配置时会�
 - 不读取或改写全局 `~/.gemini/config/mcp_config.json`；如需把项目配置写到全局，可 `--antigravity-out` 指向该路径（整体覆盖其 `mcpServers`）。
 
 依据：[MCP](https://antigravity.google/docs/mcp/)、[Skills](https://antigravity.google/docs/skills/)、[Rules](https://antigravity.google/docs/rules/)。
+
+## Zcode Desktop
+
+- **工作区 MCP**：自动加载 `.zcode/config.json` 的 `mcp.servers`（只更新该键，保留其它顶层键）。`bearerTokenEnvVar` 转成 `Authorization: Bearer ${VAR}` 头，显式变量优先于已有 Authorization 头。
+- **认证**：Zcode Desktop 从 GUI 启动，既不继承 shell 环境（`~/.zshenv` 不生效），也不展开 HTTP headers 里的 `${VAR}`——占位符为空导致认证失败，客户端侧表现为 `Version negotiation probe failed` 并无限重试。脚本因此复用**通用桥**：headers 含 `${VAR}` 的 HTTP server 自动转成 stdio 形态（`type: "stdio"` + `mcp_stdio_bridge` + `env.PATH`），运行期从 `~/.zshenv` 展开后转发；读回时自动还原为 HTTP 形态。终端里运行的 Zcode 继承 shell 环境，两种形态都可用，统一走 bridge 最稳。
+- **schema 注意**：`.zcode/config.json` 的 http 形态要求 `url` 且不接受 `command/args/env`，stdio 形态用 `type: "stdio"` + `command/args/env`；字段组合错误时整个 server 会被**静默跳过**（仅 CLI 日志出现 `config.mcp_server.skipped`，界面上无提示）。
+- **启动耗时**：bridge 内 mcp-remote 的认证探测（等 401）对“不返回 401、GET 长连”的服务器（如 FNS）会各超时一次（10s + 5s），首次响应约 15-20s，之后正常；MCP 连接超时需 ≥30s。
+- **生效**：MCP 配置在会话启动时读取，改动后需新开会话或重启 Zcode。
 
 ## Codex 认证
 

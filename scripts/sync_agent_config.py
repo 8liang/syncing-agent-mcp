@@ -190,8 +190,39 @@ def zcode_server_to_canonical(cfg: dict) -> dict:
     out = deepcopy(cfg)
     if "url" in out and "type" not in out:
         out["type"] = "http"
+    # Reverse the render-time bridge so the file round-trips cleanly: a stdio
+    # entry pointing at mcp_stdio_bridge with an HTTP URL was an authenticated
+    # HTTP server when rendered.
+    command = out.get("command")
+    args = out.get("args")
+    if (
+        isinstance(command, str)
+        and os.path.basename(command) == BRIDGE_SCRIPT.name
+        and isinstance(args, list)
+        and args
+        and isinstance(args[0], str)
+        and args[0].startswith(("http://", "https://"))
+    ):
+        out["url"] = args[0]
+        out["type"] = "http"
+        headers = {}
+        for item in args[1:]:
+            if isinstance(item, str) and ": " in item:
+                key, value = item.split(": ", 1)
+                headers[key] = value
+        if headers:
+            out["headers"] = headers
+        del out["command"]
+        del out["args"]
     if "command" in out and "type" not in out:
         out["type"] = "stdio"
+    env = out.get("env")
+    if isinstance(env, dict) and env.get("PATH") == os.environ.get("PATH"):
+        remaining = {key: value for key, value in env.items() if key != "PATH"}
+        if remaining:
+            out["env"] = remaining
+        else:
+            del out["env"]
     return out
 
 
@@ -310,6 +341,31 @@ def zcode_server_from_canonical(cfg: dict) -> dict:
         out["headers"] = headers
     elif "headers" in out:
         del out["headers"]
+
+    # ZCode Desktop GUI launches do not inherit the shell environment, so it
+    # cannot expand ${VAR} in HTTP headers: bridge authenticated HTTP servers
+    # to stdio through the bundled mcp_stdio_bridge, which expands the header
+    # templates at runtime from ~/.zshenv. The loader rebuilds the HTTP form
+    # on re-read.
+    if (
+        "url" in out
+        and any(
+            isinstance(value, str) and "${" in value
+            for value in (out.get("headers") or {}).values()
+        )
+        and BRIDGE_SCRIPT.is_file()
+    ):
+        args = [out.pop("url")]
+        args.extend(f"{key}: {value}" for key, value in out.pop("headers").items())
+        out["type"] = "stdio"
+        out["command"] = str(BRIDGE_SCRIPT)
+        out["args"] = args
+        env = dict(out.get("env") or {})
+        shell_path = os.environ.get("PATH")
+        if shell_path:
+            env.setdefault("PATH", shell_path)
+        if env:
+            out["env"] = env
     return out
 
 
@@ -547,14 +603,18 @@ def ensure_symlink(link: Path, target: Path) -> None:
     target = target.resolve()
     rel = os.path.relpath(target, link.parent)
     if link.is_symlink():
-        if link.resolve() == target:
-            return
+        try:
+            if os.readlink(link) == rel and link.resolve() == target:
+                return
+        except OSError:
+            pass
         link.unlink()
     elif link.exists():
         if link.is_dir():
             shutil.rmtree(link)
         else:
             link.unlink()
+    link.parent.mkdir(parents=True, exist_ok=True)
     link.symlink_to(rel)
 
 
@@ -562,7 +622,20 @@ def sync_skills(root: Path) -> None:
     canonical = (root / CANONICAL_SKILLS).resolve()
     canonical.mkdir(parents=True, exist_ok=True)
 
-    skill_sources = [canonical] + [(root / rel).resolve() for rel in AGENT_SKILL_DIRS]
+    skill_sources: list[Path] = [canonical]
+    for rel in AGENT_SKILL_DIRS:
+        agent_skills = root / rel
+        if agent_skills.exists():
+            try:
+                if agent_skills.is_symlink() and agent_skills.resolve() == canonical:
+                    continue
+            except OSError:
+                pass
+            skill_sources.append(agent_skills.resolve())
+    agent_dir = root / ".agent/skills"
+    if agent_dir.is_dir() and agent_dir.resolve() != canonical:
+        skill_sources.append(agent_dir.resolve())
+
     names: set[str] = set()
     for skills_root in skill_sources:
         names |= list_skill_names(skills_root)
@@ -573,15 +646,30 @@ def sync_skills(root: Path) -> None:
             for skills_root in skill_sources:
                 candidate = skills_root / name
                 if is_skill_dir(candidate):
-                    copy_skill_tree(candidate, canonical_skill)
+                    if candidate.is_symlink():
+                        try:
+                            if candidate.resolve().is_relative_to(canonical):
+                                continue
+                        except (ValueError, OSError):
+                            pass
+                    copy_skill_tree(candidate.resolve(), canonical_skill)
                     print(f"Collected skill {name} into {CANONICAL_SKILLS}", file=sys.stderr)
                     break
 
     for rel in AGENT_SKILL_DIRS:
-        agent_root = root / rel
-        agent_root.mkdir(parents=True, exist_ok=True)
-        for name in sorted(list_skill_names(canonical)):
-            ensure_symlink(agent_root / name, canonical / name)
+        agent_skills = root / rel
+        if agent_skills.exists() and not agent_skills.is_symlink() and agent_skills.is_dir():
+            for item in agent_skills.iterdir():
+                dest = canonical / item.name
+                if not dest.exists():
+                    if item.is_dir() and not item.is_symlink():
+                        shutil.copytree(item, dest)
+                        print(f"Collected {item.name} into {CANONICAL_SKILLS}", file=sys.stderr)
+                    elif item.is_file() and not item.is_symlink():
+                        shutil.copy2(item, dest)
+
+    for rel in AGENT_SKILL_DIRS:
+        ensure_symlink(root / rel, canonical)
         print(f"Linked {rel} → {CANONICAL_SKILLS}")
 
 
@@ -893,19 +981,42 @@ def self_test() -> None:
         write_text(root / ".agents" / "skills" / "shared-skill" / "SKILL.md", "# canonical\n")
         sync_skills(root)
         assert (root / ".agents" / "skills" / "demo-skill" / "SKILL.md").is_file()
-        assert (root / ".cursor" / "skills" / "demo-skill").is_symlink()
+        assert (root / ".cursor" / "skills").is_symlink()
+        assert os.readlink(root / ".cursor" / "skills") == "../.agents/skills"
+        assert (root / ".cursor" / "skills").resolve() == (root / ".agents" / "skills").resolve()
+        assert (root / ".cursor" / "skills" / "demo-skill" / "SKILL.md").read_text(encoding="utf-8") == "# demo\n"
         qoder_skill = root / ".agents" / "skills" / "qoder-skill" / "SKILL.md"
         assert qoder_skill.is_file(), "Qoder-only skills must be collected"
         assert qoder_skill.read_text(encoding="utf-8") == "# qoder\n"
-        for rel in (*AGENT_SKILL_DIRS, ".qoder/skills"):
+        for rel in AGENT_SKILL_DIRS:
+            agent_link = root / rel
+            assert agent_link.is_symlink()
+            assert not Path(os.readlink(agent_link)).is_absolute()
+            assert os.readlink(agent_link) == "../.agents/skills"
+            assert agent_link.resolve() == (root / ".agents" / "skills").resolve()
             for name in ("demo-skill", "qoder-skill", "shared-skill"):
-                link = root / rel / name
-                assert link.is_symlink()
-                assert not Path(os.readlink(link)).is_absolute()
-                assert link.resolve() == (root / ".agents" / "skills" / name).resolve()
+                assert (root / rel / name / "SKILL.md").is_file()
         assert (root / ".qoder" / "skills" / "shared-skill" / "SKILL.md").read_text(encoding="utf-8") == "# canonical\n"
+        write_text(root / ".agents" / "skills" / "live-skill" / "SKILL.md", "# live\n")
+        assert (root / ".cursor" / "skills" / "live-skill" / "SKILL.md").read_text(encoding="utf-8") == "# live\n"
         sync_skills(root)
         assert qoder_skill.read_text(encoding="utf-8") == "# qoder\n"
+        assert (root / ".cursor" / "skills").is_symlink()
+        assert os.readlink(root / ".cursor" / "skills") == "../.agents/skills"
+
+        # Test migration from old directory containing individual symlinks and extra file
+        old_cursor_dir = root / ".cursor" / "skills"
+        old_cursor_dir.unlink()
+        old_cursor_dir.mkdir(parents=True)
+        (old_cursor_dir / "old-link").symlink_to("../../.agents/skills/demo-skill")
+        (old_cursor_dir / "extra-note.txt").write_text("important note\n", encoding="utf-8")
+        write_text(root / ".agent" / "skills" / "singular-skill" / "SKILL.md", "# singular\n")
+        sync_skills(root)
+        assert old_cursor_dir.is_symlink()
+        assert os.readlink(old_cursor_dir) == "../.agents/skills"
+        assert (root / ".agents" / "skills" / "extra-note.txt").read_text(encoding="utf-8") == "important note\n"
+        assert (root / ".agents" / "skills" / "singular-skill" / "SKILL.md").read_text(encoding="utf-8") == "# singular\n"
+        assert (old_cursor_dir / "singular-skill" / "SKILL.md").read_text(encoding="utf-8") == "# singular\n"
 
         (root / "AGENTS.md").write_text("# rules\n", encoding="utf-8")
         (root / "CLAUDE.md").write_text("extra\n", encoding="utf-8")
