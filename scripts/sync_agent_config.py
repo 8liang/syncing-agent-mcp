@@ -14,6 +14,7 @@ import tempfile
 import tomllib
 from copy import deepcopy
 from pathlib import Path
+from urllib.parse import urlsplit
 
 ENV_PLACEHOLDER = re.compile(r"\$\{([A-Za-z_][A-Za-z0-9_]*)\}")
 CURSOR_ENV_PLACEHOLDER = re.compile(r"\$\{env:([A-Za-z_][A-Za-z0-9_]*)\}")
@@ -304,9 +305,25 @@ def antigravity_server_to_canonical(cfg: dict) -> dict:
     return out
 
 
+def is_antigravity_workspace_dispatch(cfg: dict) -> bool:
+    command = cfg.get("command")
+    args = cfg.get("args")
+    return (
+        isinstance(command, str)
+        and os.path.basename(command) == BRIDGE_SCRIPT.name
+        and isinstance(args, list)
+        and len(args) >= 2
+        and args[0] == "--workspace"
+    )
+
+
 def load_antigravity_servers(path: Path) -> dict:
     servers = load_mcp_json_servers(path, from_cursor=False)
-    return {name: antigravity_server_to_canonical(cfg) for name, cfg in servers.items()}
+    return {
+        name: antigravity_server_to_canonical(cfg)
+        for name, cfg in servers.items()
+        if not is_antigravity_workspace_dispatch(cfg)
+    }
 
 
 def merge_mcp_servers(root: Path) -> dict[str, dict]:
@@ -510,6 +527,103 @@ def render_antigravity_config(servers: dict, existing: Path) -> str:
     return rendered
 
 
+def is_loopback_url(url: str) -> bool:
+    host = (urlsplit(url).hostname or "").lower()
+    return host in {"localhost", "127.0.0.1", "::1", "0.0.0.0"}
+
+
+def antigravity_global_server_from_canonical(name: str, cfg: dict) -> dict:
+    args: list[str] = ["--workspace", name]
+    url = cfg.get("url") or cfg.get("serverUrl")
+    if isinstance(url, str) and url.strip() and not is_loopback_url(url.strip()):
+        headers = dict(cfg.get("headers") or {})
+        bearer = cfg.get("bearerTokenEnvVar")
+        if isinstance(bearer, str) and bearer.strip():
+            headers = {
+                key: value for key, value in headers.items()
+                if key.lower() != "authorization"
+            }
+            headers["Authorization"] = f"Bearer ${{{bearer.strip()}}}"
+        # Drop workspace-scoped default vault headers so GUI root (cwd=/)
+        # fallback never cross-pollutes vaults across projects.
+        fallback_headers = {
+            key: value for key, value in headers.items()
+            if key.lower() != "x-default-vault-name"
+        }
+        args.extend(["--fallback-http", url.strip()])
+        args.extend(f"{key}: {value}" for key, value in fallback_headers.items())
+
+    out: dict = {
+        "command": str(BRIDGE_SCRIPT),
+        "args": args,
+    }
+    shell_path = os.environ.get("PATH")
+    if shell_path:
+        out["env"] = {"PATH": shell_path}
+    return out
+
+
+def render_antigravity_global_config(servers: dict, existing: Path) -> str:
+    data: dict = {}
+    if existing.exists():
+        data = json.loads(existing.read_text(encoding="utf-8"))
+        if not isinstance(data, dict):
+            raise SystemExit(f"{existing} must be a JSON object")
+    current = data.get("mcpServers")
+    if current is None:
+        merged_servers: dict = {}
+    elif isinstance(current, dict):
+        merged_servers = deepcopy(current)
+    else:
+        raise SystemExit(f"{existing}: expected top-level mcpServers object")
+
+    for name, cfg in servers.items():
+        prev = merged_servers.get(name)
+        if (
+            isinstance(prev, dict)
+            and os.path.basename(str(prev.get("command", ""))) != BRIDGE_SCRIPT.name
+        ):
+            print(
+                f"{existing}: keeping manual global mcpServers.{name} entry",
+                file=sys.stderr,
+            )
+            continue
+        merged_servers[name] = antigravity_global_server_from_canonical(name, cfg)
+
+    data["mcpServers"] = merged_servers
+    if BRIDGE_SCRIPT.is_file() and not os.access(BRIDGE_SCRIPT, os.X_OK):
+        os.chmod(BRIDGE_SCRIPT, 0o755)
+    return render_json(data)
+
+
+def discover_antigravity_global_targets() -> list[Path]:
+    home = Path.home()
+    candidates: list[Path] = []
+    gemini_dir = home / ".gemini"
+    if gemini_dir.is_dir():
+        candidates.append(gemini_dir / "config" / "mcp_config.json")
+    t3_antigravity = home / ".t3" / "userdata" / "providers" / "antigravity"
+    if t3_antigravity.is_dir():
+        for profile in sorted(t3_antigravity.iterdir()):
+            if profile.is_dir():
+                candidates.append(profile / "config" / "mcp_config.json")
+    env_gemini_home = os.environ.get("GEMINI_HOME")
+    if env_gemini_home:
+        gh_path = Path(env_gemini_home).expanduser()
+        if gh_path.is_dir():
+            candidates.append(gh_path / "config" / "mcp_config.json")
+
+    deduped: list[Path] = []
+    seen: set[Path] = set()
+    for candidate in candidates:
+        parent_real = candidate.parent.resolve() if candidate.parent.exists() else candidate.parent
+        key = parent_real / candidate.name
+        if key not in seen:
+            seen.add(key)
+            deduped.append(candidate)
+    return deduped
+
+
 def render_codex(servers: dict) -> str:
     lines = [
         "# AUTO-GENERATED FROM .agents/mcp.json",
@@ -580,6 +694,13 @@ def render_cursor(data: dict) -> str:
 
 def write_text(path: Path, content: str) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(content, encoding="utf-8")
+
+
+def write_regular_text(path: Path, content: str) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    if path.is_symlink():
+        path.unlink()
     path.write_text(content, encoding="utf-8")
 
 
@@ -714,6 +835,7 @@ def sync_mcp(
     zcode_out: Path,
     qoder_out: Path,
     antigravity_out: Path,
+    antigravity_global_outs: list[Path] | None = None,
 ) -> None:
     servers = merge_mcp_servers(root)
     if not servers:
@@ -729,22 +851,30 @@ def sync_mcp(
     # Render everything before writing anything: a rejected source must leave
     # the existing outputs untouched rather than half-regenerated.
     rendered = [
-        (source, render_json(data)),
-        (mcp_out, render_json({"mcpServers": qoder_servers})),
-        (cursor_out, render_cursor(data)),
-        (codex_out, render_codex(servers)),
-        (zcode_out, render_zcode_config(servers, zcode_out)),
-        (qoder_out, render_qoder_config(qoder_servers, qoder_out)),
-        (antigravity_out, render_antigravity_config(servers, antigravity_out)),
+        (source, render_json(data), False),
+        (mcp_out, render_json({"mcpServers": qoder_servers}), False),
+        (cursor_out, render_cursor(data), False),
+        (codex_out, render_codex(servers), False),
+        (zcode_out, render_zcode_config(servers, zcode_out), False),
+        (qoder_out, render_qoder_config(qoder_servers, qoder_out), False),
+        (antigravity_out, render_antigravity_config(servers, antigravity_out), False),
     ]
+    for global_path in antigravity_global_outs or []:
+        rendered.append(
+            (global_path, render_antigravity_global_config(servers, global_path), True)
+        )
 
-    for path, content in rendered:
-        write_text(path, content)
+    for path, content, force_regular in rendered:
+        if force_regular:
+            write_regular_text(path, content)
+        else:
+            write_text(path, content)
         display_path = path.relative_to(root) if path.is_relative_to(root) else path
         print(f"Generated {display_path}")
 
 
 def self_test() -> None:
+    os.environ["SYNC_AGENT_MCP_SKIP_GLOBAL"] = "1"
     assert rewrite_cursor_env("Bearer ${FNS_API_KEY}") == "Bearer ${env:FNS_API_KEY}"
     assert rewrite_cursor_env("Bearer ${env:FNS_API_KEY}") == "Bearer ${env:FNS_API_KEY}"
     mixed = rewrite_json_strings(
@@ -1188,6 +1318,203 @@ def self_test() -> None:
         assert "must be a JSON object" in result.stderr
         assert antigravity_custom.read_bytes() == before_bytes
 
+    # Workspace-dispatched global Antigravity config (agy CLI & T3 Code antigravity-acp)
+    with tempfile.TemporaryDirectory() as tmp:
+        tmp_path = Path(tmp).resolve()
+        proj_a = tmp_path / "proj_a"
+        proj_b = tmp_path / "proj_b"
+        proj_c = tmp_path / "proj_c"
+        (proj_c / ".git").mkdir(parents=True)
+
+        global_gemini = tmp_path / "gemini" / "config" / "mcp_config.json"
+        global_t3 = tmp_path / "t3" / "config" / "mcp_config.json"
+        write_text(global_gemini, render_json({
+            "note": "keep-global-key",
+            "mcpServers": {
+                "manual_global": {"command": "/bin/echo", "args": ["manual"]},
+                "fns": {"command": "/custom/manual-fns", "args": ["keep-me"]},
+            },
+        }))
+        # Symlink target must be replaced with a regular file (T3 Code requires File, not symlink).
+        dummy_target = tmp_path / "symlink_target.json"
+        write_text(dummy_target, "{}\n")
+        global_t3.parent.mkdir(parents=True, exist_ok=True)
+        global_t3.symlink_to(dummy_target)
+
+        echo_mcp = tmp_path / "echo_env_mcp.py"
+        write_text(echo_mcp, (
+            "#!/usr/bin/env python3\n"
+            "import json, os, sys\n"
+            "print(json.dumps({\"cwd\": os.getcwd(), \"args\": sys.argv[1:], \"tag\": os.environ.get(\"PROJ_TAG\")}))\n"
+        ))
+        echo_mcp.chmod(0o755)
+
+        write_text(proj_a / ".agents" / "mcp.json", render_json({"mcpServers": {
+            "fns": {
+                "type": "http",
+                "url": "https://fns.example.invalid/api/mcp",
+                "headers": {
+                    "X-Default-Vault-Name": "vault-a",
+                    "X-Client": "ObsidianPlugin",
+                    "Authorization": "Bearer ${FNS_API_KEY}",
+                },
+            },
+            "local_tool": {
+                "type": "stdio",
+                "command": str(echo_mcp),
+                "args": ["from-a"],
+                "env": {"PROJ_TAG": "alpha"},
+            },
+            "loopback_http": {
+                "type": "http",
+                "url": "http://127.0.0.1:8765/mcp",
+            },
+        }}))
+
+        cmd_a = [
+            sys.executable, str(Path(__file__).resolve()), str(proj_a),
+            "--skip-skills", "--skip-docs",
+            "--antigravity-global-out", str(global_gemini),
+            "--antigravity-global-out", str(global_t3),
+        ]
+        res_a = subprocess.run(cmd_a, capture_output=True, text=True)
+        assert res_a.returncode == 0, res_a.stderr
+        assert not global_t3.is_symlink(), "global T3 mcp_config.json must be a regular file"
+
+        gemini_cfg = json.loads(global_gemini.read_text(encoding="utf-8"))
+        assert gemini_cfg["note"] == "keep-global-key"
+        assert gemini_cfg["mcpServers"]["manual_global"] == {"command": "/bin/echo", "args": ["manual"]}
+        # Manual same-name server not managed by mcp_stdio_bridge is preserved in global_gemini:
+        assert gemini_cfg["mcpServers"]["fns"] == {"command": "/custom/manual-fns", "args": ["keep-me"]}
+        assert "keeping manual global mcpServers.fns" in res_a.stderr
+
+        t3_cfg = json.loads(global_t3.read_text(encoding="utf-8"))
+        assert t3_cfg["mcpServers"]["fns"] == {
+            "command": str(BRIDGE_SCRIPT),
+            "args": [
+                "--workspace", "fns",
+                "--fallback-http", "https://fns.example.invalid/api/mcp",
+                "X-Client: ObsidianPlugin",
+                "Authorization: Bearer ${FNS_API_KEY}",
+            ],
+            "env": {"PATH": os.environ["PATH"]},
+        }
+        # Loopback HTTP and stdio servers do not get --fallback-http on GUI root cwd:
+        assert t3_cfg["mcpServers"]["local_tool"] == {
+            "command": str(BRIDGE_SCRIPT),
+            "args": ["--workspace", "local_tool"],
+            "env": {"PATH": os.environ["PATH"]},
+        }
+        assert t3_cfg["mcpServers"]["loopback_http"] == {
+            "command": str(BRIDGE_SCRIPT),
+            "args": ["--workspace", "loopback_http"],
+            "env": {"PATH": os.environ["PATH"]},
+        }
+
+        # Syncing proj_b merges into global_t3 without dropping proj_a-only servers:
+        write_text(proj_b / ".agents" / "mcp.json", render_json({"mcpServers": {
+            "local_tool": {
+                "type": "stdio",
+                "command": str(echo_mcp),
+                "args": ["from-b"],
+                "env": {"PROJ_TAG": "beta"},
+            },
+            "only_b": {"type": "stdio", "command": str(echo_mcp), "args": ["b-only"]},
+        }}))
+        res_b = subprocess.run([
+            sys.executable, str(Path(__file__).resolve()), str(proj_b),
+            "--skip-skills", "--skip-docs",
+            "--antigravity-global-out", str(global_t3),
+        ], capture_output=True, text=True)
+        assert res_b.returncode == 0, res_b.stderr
+        t3_merged = json.loads(global_t3.read_text(encoding="utf-8"))["mcpServers"]
+        assert set(t3_merged) == {"fns", "local_tool", "loopback_http", "only_b"}
+
+        # Runtime dispatch from nested subdir of proj_a chdirs to proj_a and runs proj_a config:
+        nested_a = proj_a / "ui" / "src"
+        nested_a.mkdir(parents=True)
+        run_a = subprocess.run(
+            [str(BRIDGE_SCRIPT), "--workspace", "local_tool"],
+            cwd=str(nested_a), capture_output=True, text=True,
+        )
+        assert run_a.returncode == 0, run_a.stderr
+        assert json.loads(run_a.stdout.strip()) == {
+            "cwd": str(proj_a), "args": ["from-a"], "tag": "alpha",
+        }
+
+        # Runtime dispatch in proj_b runs proj_b config with zero cross-project leakage:
+        run_b = subprocess.run(
+            [str(BRIDGE_SCRIPT), "--workspace", "local_tool"],
+            cwd=str(proj_b), capture_output=True, text=True,
+        )
+        assert run_b.returncode == 0, run_b.stderr
+        assert json.loads(run_b.stdout.strip()) == {
+            "cwd": str(proj_b), "args": ["from-b"], "tag": "beta",
+        }
+
+        # Server absent in proj_b (loopback_http) or project without .agents/mcp_config.json (proj_c)
+        # serves clean empty MCP tools/list:
+        rpc_in = "\n".join([
+            json.dumps({"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {"protocolVersion": "2025-03-26"}}),
+            json.dumps({"jsonrpc": "2.0", "method": "notifications/initialized"}),
+            json.dumps({"jsonrpc": "2.0", "id": 2, "method": "tools/list"}),
+        ]) + "\n"
+        for check_cwd, srv in [(proj_b, "loopback_http"), (proj_c, "fns"), (Path("/"), "local_tool")]:
+            noop = subprocess.run(
+                [str(BRIDGE_SCRIPT), "--workspace", srv],
+                cwd=str(check_cwd), input=rpc_in, capture_output=True, text=True,
+            )
+            assert noop.returncode == 0, noop.stderr
+            lines = [json.loads(line) for line in noop.stdout.strip().splitlines()]
+            assert len(lines) == 2
+            assert lines[0]["id"] == 1 and lines[0]["result"]["protocolVersion"] == "2025-03-26"
+            assert lines[1] == {"jsonrpc": "2.0", "id": 2, "result": {"tools": []}}
+
+        # Self-recursion guard & loader filter if --workspace stub appears in workspace mcp_config.json:
+        bad_ws = tmp_path / "bad_ws"
+        write_text(bad_ws / ".agents" / "mcp_config.json", render_json({"mcpServers": {
+            "fns": {"command": str(BRIDGE_SCRIPT), "args": ["--workspace", "fns"]},
+        }}))
+        assert load_antigravity_servers(bad_ws / ".agents" / "mcp_config.json") == {}
+        guard = subprocess.run(
+            [str(BRIDGE_SCRIPT), "--workspace", "fns"],
+            cwd=str(bad_ws), input=rpc_in, capture_output=True, text=True,
+        )
+        assert guard.returncode == 0
+        assert json.loads(guard.stdout.strip().splitlines()[-1])["result"] == {"tools": []}
+
+        # GUI root cwd (/) executes --fallback-http via mcp_stdio_bridge with ${VAR} expanded:
+        fake_bin = tmp_path / "fake_bin"
+        fake_bin.mkdir()
+        fake_remote = fake_bin / "mcp-remote"
+        write_text(fake_remote, (
+            "#!/usr/bin/env python3\n"
+            "import json, sys\n"
+            "print(json.dumps(sys.argv[1:]))\n"
+        ))
+        fake_remote.chmod(0o755)
+        gui_run = subprocess.run(
+            [
+                str(BRIDGE_SCRIPT), "--workspace", "fns",
+                "--fallback-http", "https://fns.example.invalid/api/mcp",
+                "X-Client: ObsidianPlugin",
+                "Authorization: Bearer ${TEST_FNS_TOKEN_XYZ}",
+            ],
+            cwd="/",
+            env={
+                **os.environ,
+                "TEST_FNS_TOKEN_XYZ": "resolved-secret-123",
+                "PATH": f"{fake_bin}:{os.environ['PATH']}",
+            },
+            capture_output=True, text=True,
+        )
+        assert gui_run.returncode == 0, gui_run.stderr
+        assert json.loads(gui_run.stdout.strip()) == [
+            "https://fns.example.invalid/api/mcp",
+            "--header", "X-Client: ObsidianPlugin",
+            "--header", "Authorization: Bearer resolved-secret-123",
+        ]
+
     print("self-test ok")
 
 
@@ -1212,6 +1539,17 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--zcode-out", type=Path)
     parser.add_argument("--qoder-out", type=Path)
     parser.add_argument("--antigravity-out", type=Path)
+    parser.add_argument(
+        "--antigravity-global-out",
+        type=Path,
+        action="append",
+        help="global Antigravity mcp_config.json path to merge workspace dispatchers into (repeatable)",
+    )
+    parser.add_argument(
+        "--skip-antigravity-global",
+        action="store_true",
+        help="skip syncing workspace dispatchers into ~/.gemini and T3 Code Antigravity global configs",
+    )
     parser.add_argument("--skip-skills", action="store_true")
     parser.add_argument("--skip-docs", action="store_true")
     parser.add_argument("--self-test", action="store_true")
@@ -1236,7 +1574,26 @@ def main() -> None:
     qoder_out = (args.qoder_out or root / ".qoder" / "settings.json").resolve()
     antigravity_out = (args.antigravity_out or root / ".agents" / "mcp_config.json").resolve()
 
-    sync_mcp(root, source, cursor_out, codex_out, mcp_out, zcode_out, qoder_out, antigravity_out)
+    if args.skip_antigravity_global:
+        antigravity_global_outs: list[Path] = []
+    elif args.antigravity_global_out:
+        antigravity_global_outs = [p.expanduser() for p in args.antigravity_global_out]
+    elif args.antigravity_out is not None or os.environ.get("SYNC_AGENT_MCP_SKIP_GLOBAL") == "1":
+        antigravity_global_outs = []
+    else:
+        antigravity_global_outs = discover_antigravity_global_targets()
+
+    sync_mcp(
+        root,
+        source,
+        cursor_out,
+        codex_out,
+        mcp_out,
+        zcode_out,
+        qoder_out,
+        antigravity_out,
+        antigravity_global_outs,
+    )
     if not args.skip_skills:
         sync_skills(root)
     if not args.skip_docs:

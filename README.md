@@ -1,6 +1,6 @@
 # syncing-agent-mcp
 
-在同一份项目里对齐 Cursor、Claude Code、Codex、Zcode、Qoder 与 Antigravity 的 MCP、Skills 与开发指引（Qoder CLI 自动同步，其 IDE 的 MCP 手动导入；Antigravity 自动加载工作区配置）。
+在同一份项目里对齐 Cursor、Claude Code、Codex、Zcode、Qoder 与 Antigravity 的 MCP、Skills 与开发指引（Qoder CLI 自动同步，其 IDE 的 MCP 手动导入；Antigravity 同时同步工作区配置与 `agy` CLI / T3 Code `antigravity-acp` 全局动态分发入口）。
 
 ## 布局
 
@@ -12,7 +12,8 @@
 | Codex | `.codex/config.toml` | 认证走 `bearerTokenEnvVar` / `env_http_headers` |
 | Zcode | `.zcode/config.json` | 只更新 `mcp.servers`，其它键保留；认证 HTTP server 转 stdio bridge（Desktop 不展开 `${VAR}`） |
 | Qoder CLI | `.qoder/settings.json` | 只更新 `mcpServers`，其它设置保留 |
-| Antigravity | `.agents/mcp_config.json` | 只更新 `mcpServers`，其它键保留；`url` → `serverUrl`，去 `type` |
+| Antigravity 工作区 | `.agents/mcp_config.json` | 只更新 `mcpServers`，其它键保留；`url` → `serverUrl`，去 `type` |
+| Antigravity 全局分发 | `~/.gemini/config/mcp_config.json`、`~/.t3/userdata/providers/antigravity/*/config/mcp_config.json` | 注册 `mcp_stdio_bridge --workspace <name>` 按项目 `cwd` 动态分发，保留手写全局项 |
 | Skills 源 | `.agents/skills/` | 各端 skills 目录（如 `.cursor/skills/` 等）整目录 symlink 到这里，Antigravity 原生读取 |
 | 开发指引 | `AGENTS.md` | 权威正文 |
 | Claude | `CLAUDE.md` | 固定为 `@AGENTS.md` |
@@ -43,7 +44,7 @@ python3 scripts/sync_agent_config.py /path/to/project
 
 脚本会依次：
 
-1. **MCP**：读取 `.codex/config.toml`、`.zcode/config.json`、`.qoder/settings.json`、`.mcp.json`、`.cursor/mcp.json`、`.agents/mcp_config.json`、`.agents/mcp.json`，按 server 名合并（后者覆盖前者，`.agents/mcp.json` 优先级最高），写回 `.agents/mcp.json` 并生成各端文件。
+1. **MCP**：读取 `.codex/config.toml`、`.zcode/config.json`、`.qoder/settings.json`、`.mcp.json`、`.cursor/mcp.json`、`.agents/mcp_config.json`、`.agents/mcp.json`，按 server 名合并（后者覆盖前者，`.agents/mcp.json` 优先级最高），写回 `.agents/mcp.json` 并生成各端文件（含 Antigravity 全局 `--workspace` 分发配置）。
 2. **Skills**：把各端既有 skills 收拢到 `.agents/skills/`，再将各端 `*/skills` 目录整目录建立指向 `.agents/skills` 的相对 symlink。
 3. **指引**：把 `AGENTS.md` 与 `CLAUDE.md` 中非 `@AGENTS.md` 的正文合并进 `AGENTS.md`，并将 `CLAUDE.md` 设为 `@AGENTS.md`。
 
@@ -53,9 +54,11 @@ python3 scripts/sync_agent_config.py /path/to/project
 |------|------|
 | `--skip-skills` | 跳过 skills 同步；只跑 MCP 时同时传 `--skip-docs` |
 | `--skip-docs` | 跳过 AGENTS/CLAUDE |
+| `--skip-antigravity-global` | 跳过同步 `~/.gemini` 与 T3 Code Antigravity 全局 `mcp_config.json` |
+| `--antigravity-global-out` | 指定合并写入 `--workspace` 分发项的全局 `mcp_config.json` 路径（可重复） |
 | `--self-test` | 运行内置测试（无需项目路径） |
 | `--qoder-out` | 覆盖 Qoder CLI 输出路径；输入仍从项目默认路径读取 |
-| `--antigravity-out` | 覆盖 Antigravity 输出路径；输入仍从项目默认路径读取 |
+| `--antigravity-out` | 覆盖工作区 Antigravity 输出路径；输入仍从项目默认路径读取 |
 
 MCP 校验失败时不会部分写盘；任意位置都没有 MCP 配置时会直接报错退出。
 
@@ -71,12 +74,12 @@ MCP 校验失败时不会部分写盘；任意位置都没有 MCP 配置时会�
 
 ## Antigravity
 
-- **工作区 MCP**：自动加载 `.agents/mcp_config.json` 的 `mcpServers`（只更新该键，保留其它顶层键）。远程 server 的 `url` 转成 `serverUrl`，并去掉 `type` 字段（Antigravity 不接受）。
-- **认证**：与 Qoder 相同，`bearerTokenEnvVar` 转成 `Authorization: Bearer ${VAR}` 头，显式变量优先于已有 Authorization 头。Antigravity **不展开** `${VAR}`，但脚本内置**通用桥**：HTTP server 的 headers 含 `${VAR}` 时，Antigravity 输出自动转成 stdio 形态，经内置 `scripts/mcp_stdio_bridge` 在运行期从环境（`~/.config/mcp-bridge.env` → `~/.zshenv`）展开 `${VAR}`/`${env:VAR}` 后带真实请求头转发（需 `mcp-remote`：`pnpm add -g mcp-remote`，缺失回退 `npx`；桥为 zsh 脚本）。源配置保持远程形式，其它端与读回均不受影响。也可直接在源里配真实凭据（勿提交敏感值）。
-- **启动适配**：Antigravity 从 GUI 启动 MCP server，不继承 shell PATH 且工作目录是程序目录——裸 `command`（如 `npx`、`codegraph`）会启动失败。生成文件会自动把裸命令解析为绝对路径（解析失败会 stderr 告警），并为 stdio server 补充 `env.PATH`（取同步时的 shell PATH）；该文件被作为合并输入读回时这两项自动还原，不污染源与其它端。
-- **生效与验证**：以项目根为工作区打开 → 重启 Antigravity 或重载窗口（配置在启动时发现，工作区需已信任）→ 在 MCP Servers 面板核对列表，可点 “View raw config” 对照实际读到的内容。
+- **工作区 MCP**：生成 `.agents/mcp_config.json` 的 `mcpServers`（只更新该键，保留其它顶层键）。远程 server 的 `url` 转成 `serverUrl`，并去掉 `type` 字段（Antigravity 不接受）。
+- **`agy` CLI 与 T3 Code 全局按项目分发**：`agy` CLI 与 T3 Code 内置 `antigravity-acp` 不加载项目 `.agents/mcp_config.json`，仅加载各自 `$GEMINI_HOME/config/mcp_config.json`（T3 Code 隔离在 `~/.t3/userdata/providers/antigravity/<hash>/config/mcp_config.json` 且要求为普通文件而非 symlink）。同步时脚本会自动向 `~/.gemini/config/mcp_config.json` 与 T3 Code Antigravity 配置合并写入 `mcp_stdio_bridge --workspace <name>`：运行期按进程 `$PWD` 向上定位 `<workspace>/.agents/mcp_config.json` 并启动对应项目的 server（保留各项目独立的 `X-Default-Vault-Name` 等请求头与本地 `codegraph` 工作目录；未配置该 server 的项目返回空工具列表 `[]`）。当 `Antigravity.app` 后台全局进程以 `cwd=/` 启动时，非回环远程 HTTP server 自动走剥离了 `X-Default-Vault-Name` 的 `--fallback-http` 兜底；手写的非托管全局 server 原样保留。
+- **认证**：与 Qoder 相同，`bearerTokenEnvVar` 转成 `Authorization: Bearer ${VAR}` 头，显式变量优先于已有 Authorization 头。Antigravity **不展开** `${VAR}`，但脚本内置**通用桥**：HTTP server 的 headers 含 `${VAR}` 时，Antigravity 输出自动转成 stdio 形态，经内置 `scripts/mcp_stdio_bridge` 在运行期从环境（`~/.config/mcp-bridge.env` → `~/.zshenv`）展开 `${VAR}`/`${env:VAR}` 后带真实请求头转发（需 `mcp-remote`：`pnpm add -g mcp-remote`，缺失回退 `npx`；桥依赖 zsh 与 python3）。源配置保持远程形式，其它端与读回均不受影响。也可直接在源里配真实凭据（勿提交敏感值）。
+- **启动适配**：Antigravity 从 GUI 启动 MCP server，不继承 shell PATH 且工作目录可能是程序目录——裸 `command`（如 `npx`、`codegraph`）会启动失败。生成文件会自动把裸命令解析为绝对路径（解析失败会 stderr 告警），并为 stdio server 补充 `env.PATH`（取同步时的 shell PATH）；该文件被作为合并输入读回时这两项自动还原，不污染源与其它端。
+- **生效与验证**：终端执行 `agy mcp list` 核对全局分发项；在 T3 Code 或 Antigravity IDE 中需新开会话或重载窗口（配置在会话启动时发现）。
 - **共用**：skills 直接使用 `.agents/skills/`（Antigravity 原生读取，无需 symlink 层），指引直接使用 `AGENTS.md`。
-- 不读取或改写全局 `~/.gemini/config/mcp_config.json`；如需把项目配置写到全局，可 `--antigravity-out` 指向该路径（整体覆盖其 `mcpServers`）。
 
 依据：[MCP](https://antigravity.google/docs/mcp/)、[Skills](https://antigravity.google/docs/skills/)、[Rules](https://antigravity.google/docs/rules/)。
 
