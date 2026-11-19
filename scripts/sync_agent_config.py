@@ -29,6 +29,10 @@ AGENT_SKILL_DIRS = (
 )
 CANONICAL_SKILLS = Path(".agents/skills")
 BRIDGE_SCRIPT = Path(__file__).resolve().parent / "mcp_stdio_bridge"
+BOOTSTRAP_SKILL_NAME = "project-bootstrap"
+BOOTSTRAP_SKILL_SRC = (
+    Path(__file__).resolve().parent.parent / "skills" / BOOTSTRAP_SKILL_NAME / "SKILL.md"
+)
 
 
 def q(value: object) -> str:
@@ -739,7 +743,37 @@ def ensure_symlink(link: Path, target: Path) -> None:
     link.symlink_to(rel)
 
 
-def sync_skills(root: Path) -> None:
+def has_project_instructions(root: Path) -> bool:
+    if any(
+        (root / rel).is_file()
+        for rel in ("AGENTS.md", "CLAUDE.md", "GEMINI.md", ".agents/AGENTS.md", ".agents/GEMINI.md")
+    ):
+        return True
+    rules_dir = root / ".agents" / "rules"
+    return rules_dir.is_dir() and any(rules_dir.glob("*.md"))
+
+
+def sync_bootstrap_skill(root: Path) -> None:
+    if not has_project_instructions(root):
+        return
+    if not BOOTSTRAP_SKILL_SRC.is_file():
+        print(
+            f"Warning: bootstrap skill template missing at {BOOTSTRAP_SKILL_SRC}",
+            file=sys.stderr,
+        )
+        return
+    content = BOOTSTRAP_SKILL_SRC.read_text(encoding="utf-8")
+    dest = root / CANONICAL_SKILLS / BOOTSTRAP_SKILL_NAME / "SKILL.md"
+    if not dest.is_symlink() and dest.is_file() and dest.read_text(encoding="utf-8") == content:
+        return
+    write_regular_text(dest, content)
+    print(f"Synced {dest.relative_to(root)}")
+
+
+def sync_skills(root: Path, *, include_bootstrap: bool = True) -> None:
+    if include_bootstrap:
+        sync_bootstrap_skill(root)
+
     canonical = (root / CANONICAL_SKILLS).resolve()
     canonical.mkdir(parents=True, exist_ok=True)
 
@@ -1515,6 +1549,59 @@ def self_test() -> None:
             "--header", "Authorization: Bearer resolved-secret-123",
         ]
 
+    # Bundled project-bootstrap skill: synced only when project instructions exist,
+    # overridable via --skip-bootstrap-skill, and kept as a regular file in canonical.
+    assert BOOTSTRAP_SKILL_SRC.is_file(), f"missing {BOOTSTRAP_SKILL_SRC}"
+    bootstrap_text = BOOTSTRAP_SKILL_SRC.read_text(encoding="utf-8")
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp).resolve()
+        write_text(root / ".mcp.json", render_json({"mcpServers": {"demo": {"command": "demo"}}}))
+
+        # No AGENTS.md / CLAUDE.md / GEMINI.md / .agents/rules -> no project-bootstrap created.
+        sync_skills(root)
+        assert not (root / ".agents" / "skills" / BOOTSTRAP_SKILL_NAME).exists()
+
+        # With AGENTS.md present (and a stale symlink in canonical), sync_skills installs the latest copy.
+        write_text(root / "AGENTS.md", "# Project Rules\n")
+        stale_target = root / "stale.md"
+        write_text(stale_target, "stale\n")
+        bootstrap_dest = root / ".agents" / "skills" / BOOTSTRAP_SKILL_NAME / "SKILL.md"
+        bootstrap_dest.parent.mkdir(parents=True, exist_ok=True)
+        bootstrap_dest.symlink_to(stale_target)
+
+        sync_skills(root)
+        assert not bootstrap_dest.is_symlink()
+        assert bootstrap_dest.read_text(encoding="utf-8") == bootstrap_text
+        for rel in AGENT_SKILL_DIRS:
+            assert (root / rel / BOOTSTRAP_SKILL_NAME / "SKILL.md").read_text(encoding="utf-8") == bootstrap_text
+
+        # Opt-out flag skips syncing project-bootstrap while keeping MCP/docs/other skills working.
+        shutil.rmtree(root / ".agents" / "skills" / BOOTSTRAP_SKILL_NAME)
+        res_skip = subprocess.run(
+            [
+                sys.executable, str(Path(__file__).resolve()), str(root),
+                "--skip-antigravity-global", "--skip-bootstrap-skill",
+            ],
+            capture_output=True, text=True,
+        )
+        assert res_skip.returncode == 0, res_skip.stderr
+        assert not bootstrap_dest.exists()
+
+        # Without opt-out, CLI syncs docs + skills including project-bootstrap (even from CLAUDE.md alone).
+        (root / "AGENTS.md").unlink()
+        write_text(root / "CLAUDE.md", "# Claude Rules\n")
+        res_full = subprocess.run(
+            [
+                sys.executable, str(Path(__file__).resolve()), str(root),
+                "--skip-antigravity-global",
+            ],
+            capture_output=True, text=True,
+        )
+        assert res_full.returncode == 0, res_full.stderr
+        assert (root / "AGENTS.md").read_text(encoding="utf-8") == "# Claude Rules\n"
+        assert (root / "CLAUDE.md").read_text(encoding="utf-8") == "@AGENTS.md\n"
+        assert bootstrap_dest.read_text(encoding="utf-8") == bootstrap_text
+
     print("self-test ok")
 
 
@@ -1551,6 +1638,11 @@ def parse_args() -> argparse.Namespace:
         help="skip syncing workspace dispatchers into ~/.gemini and T3 Code Antigravity global configs",
     )
     parser.add_argument("--skip-skills", action="store_true")
+    parser.add_argument(
+        "--skip-bootstrap-skill",
+        action="store_true",
+        help="skip syncing the bundled project-bootstrap skill into .agents/skills",
+    )
     parser.add_argument("--skip-docs", action="store_true")
     parser.add_argument("--self-test", action="store_true")
     return parser.parse_args()
@@ -1594,10 +1686,10 @@ def main() -> None:
         antigravity_out,
         antigravity_global_outs,
     )
-    if not args.skip_skills:
-        sync_skills(root)
     if not args.skip_docs:
         sync_agent_docs(root)
+    if not args.skip_skills:
+        sync_skills(root, include_bootstrap=not args.skip_bootstrap_skill)
 
 
 if __name__ == "__main__":

@@ -14,7 +14,7 @@
 | Qoder CLI | `.qoder/settings.json` | 只更新 `mcpServers`，其它设置保留 |
 | Antigravity 工作区 | `.agents/mcp_config.json` | 只更新 `mcpServers`，其它键保留；`url` → `serverUrl`，去 `type` |
 | Antigravity 全局分发 | `~/.gemini/config/mcp_config.json`、`~/.t3/userdata/providers/antigravity/*/config/mcp_config.json` | 注册 `mcp_stdio_bridge --workspace <name>` 按项目 `cwd` 动态分发，保留手写全局项 |
-| Skills 源 | `.agents/skills/` | 各端 skills 目录（如 `.cursor/skills/` 等）整目录 symlink 到这里，Antigravity 原生读取 |
+| Skills 源 | `.agents/skills/` | 各端 skills 目录（如 `.cursor/skills/` 等）整目录 symlink 指向这里，Antigravity 原生读取；项目存在指引文档时自动写入通用 `project-bootstrap` skill |
 | 开发指引 | `AGENTS.md` | 权威正文 |
 | Claude | `CLAUDE.md` | 固定为 `@AGENTS.md` |
 
@@ -32,6 +32,12 @@ npx skills add 8liang/syncing-agent-mcp -g -a claude-code -y
 npx skills add 8liang/syncing-agent-mcp -g -a claude-code -a cursor -y
 ```
 
+如需同时把通用启动 skill `project-bootstrap` 全局安装（对尚未跑过同步脚本的仓库也生效）：
+
+```bash
+npx skills add 8liang/syncing-agent-mcp --full-depth --skill project-bootstrap -g -y
+```
+
 ## 使用
 
 对项目根目录运行 skill 自带脚本（不要拷进业务仓库）：
@@ -45,14 +51,15 @@ python3 scripts/sync_agent_config.py /path/to/project
 脚本会依次：
 
 1. **MCP**：读取 `.codex/config.toml`、`.zcode/config.json`、`.qoder/settings.json`、`.mcp.json`、`.cursor/mcp.json`、`.agents/mcp_config.json`、`.agents/mcp.json`，按 server 名合并（后者覆盖前者，`.agents/mcp.json` 优先级最高），写回 `.agents/mcp.json` 并生成各端文件（含 Antigravity 全局 `--workspace` 分发配置）。
-2. **Skills**：把各端既有 skills 收拢到 `.agents/skills/`，再将各端 `*/skills` 目录整目录建立指向 `.agents/skills` 的相对 symlink。
-3. **指引**：把 `AGENTS.md` 与 `CLAUDE.md` 中非 `@AGENTS.md` 的正文合并进 `AGENTS.md`，并将 `CLAUDE.md` 设为 `@AGENTS.md`。
+2. **指引**：把 `AGENTS.md` 与 `CLAUDE.md` 中非 `@AGENTS.md` 的正文合并进 `AGENTS.md`，并将 `CLAUDE.md` 设为 `@AGENTS.md`。
+3. **Skills**：若项目存在 `AGENTS.md` / `CLAUDE.md` / `GEMINI.md` / `.agents/rules/*.md`，自动同步内置的通用 `project-bootstrap` skill 到 `.agents/skills/project-bootstrap/SKILL.md`（帮助初始 `cwd` 偏离仓库根或未自动注入 `AGENTS.md` 的运行环境先定位并载入项目指引），再把各端既有 skills 收拢到 `.agents/skills/`，并将各端 `*/skills` 目录整目录建立指向 `.agents/skills` 的相对 symlink。
 
 可选：
 
 | 参数 | 作用 |
 |------|------|
-| `--skip-skills` | 跳过 skills 同步；只跑 MCP 时同时传 `--skip-docs` |
+| `--skip-skills` | 跳过 skills 同步（含 `project-bootstrap`）；只跑 MCP 时同时传 `--skip-docs` |
+| `--skip-bootstrap-skill` | 跳过自动写入 `.agents/skills/project-bootstrap/SKILL.md` |
 | `--skip-docs` | 跳过 AGENTS/CLAUDE |
 | `--skip-antigravity-global` | 跳过同步 `~/.gemini` 与 T3 Code Antigravity 全局 `mcp_config.json` |
 | `--antigravity-global-out` | 指定合并写入 `--workspace` 分发项的全局 `mcp_config.json` 路径（可重复） |
