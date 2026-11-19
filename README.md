@@ -83,7 +83,7 @@ MCP 校验失败时不会部分写盘；任意位置都没有 MCP 配置时会�
 
 - **工作区 MCP**：生成 `.agents/mcp_config.json` 的 `mcpServers`（只更新该键，保留其它顶层键）。远程 server 的 `url` 转成 `serverUrl`，并去掉 `type` 字段（Antigravity 不接受）。
 - **`agy` CLI 与 T3 Code 全局按项目分发**：`agy` CLI 与 T3 Code 内置 `antigravity-acp` 不加载项目 `.agents/mcp_config.json`，仅加载各自 `$GEMINI_HOME/config/mcp_config.json`（T3 Code 隔离在 `~/.t3/userdata/providers/antigravity/<hash>/config/mcp_config.json` 且要求为普通文件而非 symlink）。同步时脚本会自动向 `~/.gemini/config/mcp_config.json` 与 T3 Code Antigravity 配置合并写入 `mcp_stdio_bridge --workspace <name>`：运行期按进程 `$PWD` 向上定位 `<workspace>/.agents/mcp_config.json` 并启动对应项目的 server（保留各项目独立的 `X-Default-Vault-Name` 等请求头与本地 `codegraph` 工作目录；未配置该 server 的项目返回空工具列表 `[]`）。当 `Antigravity.app` 后台全局进程以 `cwd=/` 启动时，非回环远程 HTTP server 自动走剥离了 `X-Default-Vault-Name` 的 `--fallback-http` 兜底；手写的非托管全局 server 原样保留。
-- **认证**：与 Qoder 相同，`bearerTokenEnvVar` 转成 `Authorization: Bearer ${VAR}` 头，显式变量优先于已有 Authorization 头。Antigravity **不展开** `${VAR}`，但脚本内置**通用桥**：HTTP server 的 headers 含 `${VAR}` 时，Antigravity 输出自动转成 stdio 形态，经内置 `scripts/mcp_stdio_bridge` 在运行期从环境（`~/.config/mcp-bridge.env` → `~/.zshenv`）展开 `${VAR}`/`${env:VAR}` 后带真实请求头转发（需 `mcp-remote`：`pnpm add -g mcp-remote`，缺失回退 `npx`；桥依赖 zsh 与 python3）。源配置保持远程形式，其它端与读回均不受影响。也可直接在源里配真实凭据（勿提交敏感值）。
+- **认证**：与 Qoder 相同，`bearerTokenEnvVar` 转成 `Authorization: Bearer ${VAR}` 头，显式变量优先于已有 Authorization 头。Antigravity **不展开** `${VAR}`，但脚本内置**通用桥**：HTTP server 的 headers 含 `${VAR}` 时，Antigravity 输出自动转成 stdio 形态，经内置 `scripts/mcp_stdio_bridge` 在运行期从环境（`~/.config/mcp-bridge.env` → `~/.zshenv`）展开 `${VAR}`/`${env:VAR}` 后带真实请求头转发（带静态鉴权头或回环地址时自动走内置 `mcp_http_stdio_bridge.mjs` 直连 Streamable HTTP，零 OAuth 探测延迟；无静态鉴权的远程 OAuth 端点或 `--use-mcp-remote` 回退 `mcp-remote`；桥依赖 zsh、python3 与 node）。源配置保持远程形式，其它端与读回均不受影响。也可直接在源里配真实凭据（勿提交敏感值）。
 - **启动适配**：Antigravity 从 GUI 启动 MCP server，不继承 shell PATH 且工作目录可能是程序目录——裸 `command`（如 `npx`、`codegraph`）会启动失败。生成文件会自动把裸命令解析为绝对路径（解析失败会 stderr 告警），并为 stdio server 补充 `env.PATH`（取同步时的 shell PATH）；该文件被作为合并输入读回时这两项自动还原，不污染源与其它端。
 - **生效与验证**：终端执行 `agy mcp list` 核对全局分发项；在 T3 Code 或 Antigravity IDE 中需新开会话或重载窗口（配置在会话启动时发现）。
 - **共用**：skills 直接使用 `.agents/skills/`（Antigravity 原生读取，无需 symlink 层），指引直接使用 `AGENTS.md`。
@@ -95,7 +95,7 @@ MCP 校验失败时不会部分写盘；任意位置都没有 MCP 配置时会�
 - **工作区 MCP**：自动加载 `.zcode/config.json` 的 `mcp.servers`（只更新该键，保留其它顶层键）。`bearerTokenEnvVar` 转成 `Authorization: Bearer ${VAR}` 头，显式变量优先于已有 Authorization 头。
 - **认证**：Zcode Desktop 从 GUI 启动，既不继承 shell 环境（`~/.zshenv` 不生效），也不展开 HTTP headers 里的 `${VAR}`——占位符为空导致认证失败，客户端侧表现为 `Version negotiation probe failed` 并无限重试。脚本因此复用**通用桥**：headers 含 `${VAR}` 的 HTTP server 自动转成 stdio 形态（`type: "stdio"` + `mcp_stdio_bridge` + `env.PATH`），运行期从 `~/.zshenv` 展开后转发；读回时自动还原为 HTTP 形态。终端里运行的 Zcode 继承 shell 环境，两种形态都可用，统一走 bridge 最稳。
 - **schema 注意**：`.zcode/config.json` 的 http 形态要求 `url` 且不接受 `command/args/env`，stdio 形态用 `type: "stdio"` + `command/args/env`；字段组合错误时整个 server 会被**静默跳过**（仅 CLI 日志出现 `config.mcp_server.skipped`，界面上无提示）。
-- **启动耗时**：bridge 内 mcp-remote 的认证探测（等 401）对“不返回 401、GET 长连”的服务器（如 FNS）会各超时一次（10s + 5s），首次响应约 15-20s，之后正常；MCP 连接超时需 ≥30s。
+- **启动耗时**：带静态鉴权头（如 `Authorization` / API Key）或回环地址的 HTTP server 由内置 `mcp_http_stdio_bridge.mjs` 直连 Streamable HTTP，跳过 `mcp-remote` 的 10s + 5s OAuth `GET` 探测超时，FNS 首次握手从 ~15-20s 降至 <1s。仅未带静态鉴权的远程 OAuth 端点会回退 `mcp-remote`（可用 `--use-mcp-remote` 或 `MCP_BRIDGE_TRANSPORT=mcp-remote` 强制切换）。
 - **生效**：MCP 配置在会话启动时读取，改动后需新开会话或重启 Zcode。
 
 ## Codex 认证

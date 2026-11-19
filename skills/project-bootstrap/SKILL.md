@@ -15,7 +15,8 @@ Skip if the target repository's `AGENTS.md` (or equivalent root instructions) is
 
 1. **Resolve the target repository root(s)**: Never assume initial `cwd` is the repo root—sessions often start in a subdirectory, git worktree, symlinked path, temp/attachment folder, or multi-workspace root. Resolve the target root from workspace metadata, by walking up from target file paths to `.git` or `AGENTS.md`, or via `git rev-parse --show-toplevel`.
 2. **Parallelize root instruction reads**: On the very first turn (including in parallel with loading this skill when the repo root is known), read `<repo-root>/AGENTS.md` directly. If absent or delegated, batch reads of `CLAUDE.md`, `GEMINI.md`, `.agents/AGENTS.md`, `.agents/GEMINI.md`, `.agents/rules/*.md`, and any directory-level `AGENTS.md` along the path to files you touch.
-3. **Batch mandatory entrypoints; load `MEMORY.md` only on demand**: Read only the startup-required entrypoints specified by `AGENTS.md` (such as a knowledge-base index or architecture doc) in parallel before designing or proposing changes. Read `MEMORY.md` (or long-term memory notes) **only on demand** when the task needs historical context or debugging memory—not as a mandatory startup read. Execute any verification or post-change sync steps mandated by `AGENTS.md` before finishing.
+3. **Batch mandatory entrypoints; avoid speculative startup reads**: Read only the startup-required entrypoints specified by `AGENTS.md` (and skip optional/on-demand entrypoints until the task actually needs them). Read `MEMORY.md` (or long-term memory notes) **only on demand** when the task needs historical context or debugging memory—not as a mandatory startup read. Execute any verification or post-change sync steps mandated by `AGENTS.md` before finishing.
+4. **Minimize startup turns**: Do **not** proactively load unrelated skills (such as `project-memory` or orchestration configs), run `git status`/`git log`, or probe lazy-MCP schema files when the exact tool signature is already documented in `AGENTS.md` or not yet needed. If the user only sends a bare bootstrap prompt (e.g. "准备工作"), complete bootstrap in 1–2 turns and reply concisely.
 
 ## Red Flags — STOP and Load First
 
@@ -25,3 +26,4 @@ Skip if the target repository's `AGENTS.md` (or equivalent root instructions) is
 | "Initial `cwd` has no `AGENTS.md`" | `cwd` often differs from the repo root; resolve the root from target paths or workspace roots. |
 | "`ls` failed or directory listing is restricted" | Read `<repo-root>/AGENTS.md` directly by path instead of skipping it. |
 | "I'll read code first, docs later" | Root docs specify which architecture docs, helpers, and verification commands are mandatory. |
+| "Let me also check git status, extra skills, and MCP schemas during bootstrap" | Every extra sequential probe adds another full LLM round-trip; only run what the current request actually requires. |

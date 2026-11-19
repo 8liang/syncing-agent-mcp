@@ -2,13 +2,20 @@
 # Generic stdio ↔ HTTP bridge and workspace MCP dispatcher for Antigravity / Zcode.
 #
 # Usage:
-#   mcp_stdio_bridge <url> ["Header: value" ...]
+#   mcp_stdio_bridge [--use-mcp-remote] <url> ["Header: value" ...]
 #   mcp_stdio_bridge --expand "string with ${VAR} or ${env:VAR}"
 #   mcp_stdio_bridge --workspace <server_name> [--fallback-http <url> ["Header: value" ...]]
 #
 # Header values are expanded at runtime from the user environment, loaded from
-# ~/.config/mcp-bridge.env (optional) and ~/.zshenv. Needs mcp-remote on PATH
-# (`pnpm add -g mcp-remote`); falls back to `npx -y mcp-remote`.
+# ~/.config/mcp-bridge.env (optional) and ~/.zshenv.
+#
+# For static-auth HTTP servers (Authorization / API key headers) and loopback
+# URLs (127.0.0.1 / localhost / [::1]), the bridge uses the bundled direct
+# Streamable HTTP forwarder (mcp_http_stdio_bridge.mjs via node), avoiding
+# mcp-remote's 10s + 5s OAuth GET discovery timeouts on non-OAuth servers such
+# as FNS. Unauthenticated remote endpoints (OAuth2) or --use-mcp-remote /
+# MCP_BRIDGE_TRANSPORT=mcp-remote fall back to mcp-remote (`pnpm add -g
+# mcp-remote`, or `npx -y mcp-remote`).
 #
 # In --workspace mode (used in global ~/.gemini/config/mcp_config.json and T3 Code
 # ~/.t3/userdata/providers/antigravity/*/config/mcp_config.json because agy CLI and
@@ -183,10 +190,18 @@ serve_noop_mcp(server_name)
 ' "${0:A}" "$@"
 fi
 
+force_mcp_remote=0
+if [[ "$1" == "--use-mcp-remote" ]]; then
+  force_mcp_remote=1
+  shift
+fi
+
 if (( $# < 1 )); then
-  print -u2 "usage: mcp_stdio_bridge <url> ['Header: value' ...]"
+  print -u2 "usage: mcp_stdio_bridge [--use-mcp-remote] <url> ['Header: value' ...]"
   exit 2
 fi
+
+export PATH="${PATH}:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin"
 
 # Secrets usually live in shell profiles; load them without touching stdout
 # (stdout carries the MCP JSON-RPC stream).
@@ -197,12 +212,54 @@ fi
 
 url=$1
 shift
-typeset -a hdrs
+
+typeset -a expanded_hdrs
+typeset -a remote_hdrs
+has_static_auth=0
 for item in "$@"; do
-  hdrs+=(--header "$(expand "$item")")
+  expanded=$(expand "$item")
+  expanded_hdrs+=("$expanded")
+  remote_hdrs+=(--header "$expanded")
+  hdr_key=${expanded%%:*}
+  hdr_key_lower=${(L)${hdr_key// /}}
+  case "$hdr_key_lower" in
+    authorization|accesstoken|token|x-api-key|api-key|x-auth-token)
+      has_static_auth=1
+      ;;
+  esac
 done
 
-if command -v mcp-remote >/dev/null 2>&1; then
-  exec mcp-remote "$url" "${hdrs[@]}"
+is_loopback=0
+case "$url" in
+  http://127.0.0.1[:/]*|http://127.0.0.1|http://localhost[:/]*|http://localhost|http://\[::1\][:/]*|http://\[::1\]|https://127.0.0.1[:/]*|https://127.0.0.1|https://localhost[:/]*|https://localhost|https://\[::1\][:/]*|https://\[::1\])
+    is_loopback=1
+    ;;
+esac
+
+script_dir=${0:A:h}
+direct_script="$script_dir/mcp_http_stdio_bridge.mjs"
+transport_pref=${MCP_BRIDGE_TRANSPORT:-auto}
+
+use_direct=0
+if (( ! force_mcp_remote )) && [[ "$transport_pref" != "mcp-remote" ]]; then
+  if [[ "$transport_pref" == "direct" ]] || (( has_static_auth || is_loopback )); then
+    if [[ -f "$direct_script" ]] && command -v node >/dev/null 2>&1; then
+      use_direct=1
+    fi
+  fi
 fi
-exec npx -y mcp-remote "$url" "${hdrs[@]}"
+
+if (( use_direct )); then
+  export MCP_BRIDGE_HDR_COUNT=${#expanded_hdrs[@]}
+  idx=0
+  for item in "${expanded_hdrs[@]}"; do
+    export "MCP_BRIDGE_HDR_${idx}=${item}"
+    (( idx++ ))
+  done
+  exec node "$direct_script" "$url"
+fi
+
+if command -v mcp-remote >/dev/null 2>&1; then
+  exec mcp-remote "$url" "${remote_hdrs[@]}"
+fi
+exec npx -y mcp-remote "$url" "${remote_hdrs[@]}"

@@ -1518,6 +1518,7 @@ def self_test() -> None:
         assert json.loads(guard.stdout.strip().splitlines()[-1])["result"] == {"tools": []}
 
         # GUI root cwd (/) executes --fallback-http via mcp_stdio_bridge with ${VAR} expanded:
+        # 1) Legacy mcp-remote fallback (forced via MCP_BRIDGE_TRANSPORT=mcp-remote or unauthenticated OAuth URL)
         fake_bin = tmp_path / "fake_bin"
         fake_bin.mkdir()
         fake_remote = fake_bin / "mcp-remote"
@@ -1537,6 +1538,7 @@ def self_test() -> None:
             cwd="/",
             env={
                 **os.environ,
+                "MCP_BRIDGE_TRANSPORT": "mcp-remote",
                 "TEST_FNS_TOKEN_XYZ": "resolved-secret-123",
                 "PATH": f"{fake_bin}:{os.environ['PATH']}",
             },
@@ -1548,6 +1550,124 @@ def self_test() -> None:
             "--header", "X-Client: ObsidianPlugin",
             "--header", "Authorization: Bearer resolved-secret-123",
         ]
+
+        # 2) Unauthenticated remote HTTPS URL automatically uses mcp-remote (OAuth-capable)
+        oauth_run = subprocess.run(
+            [
+                str(BRIDGE_SCRIPT), "--workspace", "oauth_srv",
+                "--fallback-http", "https://oauth.example.invalid/mcp",
+                "X-Client: TestClient",
+            ],
+            cwd="/",
+            env={
+                **os.environ,
+                "PATH": f"{fake_bin}:{os.environ['PATH']}",
+            },
+            capture_output=True, text=True,
+        )
+        assert oauth_run.returncode == 0, oauth_run.stderr
+        assert json.loads(oauth_run.stdout.strip()) == [
+            "https://oauth.example.invalid/mcp",
+            "--header", "X-Client: TestClient",
+        ]
+
+        # 3) Static-auth / loopback HTTP server uses direct Streamable HTTP bridge (zero GET probes)
+        import http.server, threading
+        seen_requests = []
+        class MockMcpHandler(http.server.BaseHTTPRequestHandler):
+            def log_message(self, format, *args):
+                pass
+            def do_GET(self):
+                seen_requests.append(("GET", self.path))
+                self.send_response(500)
+                self.end_headers()
+            def do_POST(self):
+                length = int(self.headers.get("Content-Length", "0"))
+                body = json.loads(self.rfile.read(length).decode("utf-8"))
+                seen_requests.append((
+                    "POST",
+                    body.get("method"),
+                    self.headers.get("Authorization"),
+                    self.headers.get("X-Client"),
+                    self.headers.get("Mcp-Session-Id"),
+                    self.headers.get("Accept"),
+                ))
+                method = body.get("method")
+                if method == "initialize":
+                    resp = json.dumps({
+                        "jsonrpc": "2.0",
+                        "id": body["id"],
+                        "result": {"protocolVersion": "2024-11-05", "capabilities": {}, "serverInfo": {"name": "mock", "version": "1.0"}},
+                    }).encode("utf-8")
+                    self.send_response(200)
+                    self.send_header("Content-Type", "application/json")
+                    self.send_header("Mcp-Session-Id", "sess-direct-42")
+                    self.send_header("Content-Length", str(len(resp)))
+                    self.end_headers()
+                    self.wfile.write(resp)
+                elif method == "notifications/initialized":
+                    self.send_response(202)
+                    self.end_headers()
+                elif method == "tools/list":
+                    sse = (
+                        "event: message\n"
+                        + "data: " + json.dumps({
+                            "jsonrpc": "2.0",
+                            "id": body["id"],
+                            "result": {"tools": [{"name": "ping"}]},
+                        }) + "\n\n"
+                    ).encode("utf-8")
+                    self.send_response(200)
+                    self.send_header("Content-Type", "text/event-stream")
+                    self.send_header("Content-Length", str(len(sse)))
+                    self.end_headers()
+                    self.wfile.write(sse)
+                else:
+                    self.send_response(500)
+                    self.end_headers()
+                    self.wfile.write(b"boom")
+
+        srv = http.server.ThreadingHTTPServer(("127.0.0.1", 0), MockMcpHandler)
+        port = srv.server_address[1]
+        t = threading.Thread(target=srv.serve_forever, daemon=True)
+        t.start()
+        try:
+            direct_in = (
+                json.dumps({"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {}}) + "\n"
+                + json.dumps({"jsonrpc": "2.0", "method": "notifications/initialized"}) + "\n"
+                + json.dumps({"jsonrpc": "2.0", "id": 2, "method": "tools/list", "params": {}}) + "\n"
+                + json.dumps({"jsonrpc": "2.0", "id": 3, "method": "tools/call", "params": {"name": "fail"}}) + "\n"
+            )
+            direct_run = subprocess.run(
+                [
+                    str(BRIDGE_SCRIPT),
+                    f"http://127.0.0.1:{port}/api/mcp",
+                    "X-Client: ObsidianPlugin",
+                    "Authorization: Bearer ${TEST_FNS_TOKEN_XYZ}",
+                ],
+                input=direct_in,
+                env={
+                    **os.environ,
+                    "TEST_FNS_TOKEN_XYZ": "resolved-secret-123",
+                },
+                capture_output=True, text=True,
+                timeout=10,
+            )
+            assert direct_run.returncode == 0, direct_run.stderr
+            out_msgs = {m["id"]: m for m in (json.loads(line) for line in direct_run.stdout.strip().splitlines())}
+            assert out_msgs[1]["result"]["serverInfo"]["name"] == "mock"
+            assert out_msgs[2]["result"]["tools"] == [{"name": "ping"}]
+            assert out_msgs[3]["error"]["code"] == -32000
+            assert not any(r[0] == "GET" for r in seen_requests), f"unexpected GET: {seen_requests}"
+            by_method = {r[1]: r for r in seen_requests}
+            assert by_method["initialize"][2] == "Bearer resolved-secret-123"
+            assert by_method["initialize"][3] == "ObsidianPlugin"
+            assert "text/event-stream" in (by_method["initialize"][5] or "")
+            assert by_method["notifications/initialized"][4] == "sess-direct-42"
+            assert by_method["tools/list"][4] == "sess-direct-42"
+        finally:
+            srv.shutdown()
+            srv.server_close()
 
     # Bundled project-bootstrap skill: synced only when project instructions exist,
     # overridable via --skip-bootstrap-skill, and kept as a regular file in canonical.
