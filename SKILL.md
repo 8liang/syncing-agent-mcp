@@ -1,6 +1,6 @@
 ---
 name: syncing-agent-mcp
-description: 当 Cursor、Claude Code、Codex、Zcode、Qoder CLI / IDE、Antigravity（含 agy CLI 与 T3 Code antigravity-acp）的 MCP、项目 skills（含启动载入 AGENTS.md 的 `project-bootstrap`）、AGENTS.md 需要对齐，或 `.agents/mcp.json`、`.mcp.json`、`.cursor/mcp.json`、`.codex/config.toml`、`.zcode/config.json`、`.qoder/settings.json`、`.agents/mcp_config.json` 漂移时使用；也适用于 `${VAR}` / `${env:VAR}`、Codex http_headers 未展开导致 not logged in、Antigravity 不展开 `${VAR}`、agy CLI 或 T3 Code Antigravity 不读取项目 `.agents/mcp_config.json` 导致 MCP 未挂载、Zcode Desktop GUI 不展开 `${VAR}` 且不继承 shell 环境导致认证失败，以及 Qoder IDE 手动导入 MCP 的场景。
+description: 对齐 Cursor、Claude Code、Codex、Zcode、Qoder、Antigravity（含 agy CLI / T3 Code）的项目 MCP、skills（含 project-bootstrap）与 AGENTS.md；处理 .agents/mcp.json 等配置漂移、${VAR} 认证展开与桥接、Antigravity 全局分发与 Qoder IDE 手动导入。
 ---
 
 # Syncing Agent MCP
