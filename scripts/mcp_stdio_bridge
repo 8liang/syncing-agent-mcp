@@ -1,265 +1,38 @@
 #!/bin/zsh
-# Generic stdio ↔ HTTP bridge and workspace MCP dispatcher for Antigravity / Zcode.
+# Generic stdio <-> HTTP bridge and workspace MCP dispatcher for Antigravity / Zcode.
 #
 # Usage:
 #   mcp_stdio_bridge [--use-mcp-remote] <url> ["Header: value" ...]
 #   mcp_stdio_bridge --expand "string with ${VAR} or ${env:VAR}"
 #   mcp_stdio_bridge --workspace <server_name> [--fallback-http <url> ["Header: value" ...]]
 #
-# Header values are expanded at runtime from the user environment, loaded from
-# ~/.config/mcp-bridge.env (optional) and ~/.zshenv.
-#
-# For static-auth HTTP servers (Authorization / API key headers) and loopback
-# URLs (127.0.0.1 / localhost / [::1]), the bridge uses the bundled direct
-# Streamable HTTP forwarder (mcp_http_stdio_bridge.mjs via node), avoiding
-# mcp-remote's 10s + 5s OAuth GET discovery timeouts on non-OAuth servers such
-# as FNS. Unauthenticated remote endpoints (OAuth2) or --use-mcp-remote /
-# MCP_BRIDGE_TRANSPORT=mcp-remote fall back to mcp-remote (`pnpm add -g
-# mcp-remote`, or `npx -y mcp-remote`).
-#
-# In --workspace mode (used in global ~/.gemini/config/mcp_config.json and T3 Code
-# ~/.t3/userdata/providers/antigravity/*/config/mcp_config.json because agy CLI and
-# antigravity-acp ignore workspace .agents/mcp_config.json), the bridge walks up
-# from $PWD to locate the active project's .agents/mcp_config.json and execs that
-# project's server definition. If the current project does not configure the server,
-# it serves a minimal empty MCP responder (tools: []) so unrelated projects stay clean.
+# Delegates immediately to the unified Node runtime (mcp_http_stdio_bridge.mjs)
+# so --workspace routing, ${VAR} expansion, and Streamable HTTP forwarding run
+# in a single Node process (no python3 cold-start or multi-shell hop).
 emulate -L zsh
-
-expand() {
-  local s=$1 out='' pre rest name
-  while [[ $s == *'${'* ]]; do
-    pre=${s%%'${'*}
-    rest=${s#*'${'}
-    if [[ $rest != *'}'* ]]; then
-      out="${out}${s}"
-      s=''
-      break
-    fi
-    name=${rest%%'}'*}
-    name=${name#env:}
-    out="${out}${pre}${(P)name}"
-    s=${rest#*'}'}
-  done
-  print -rn -- "${out}${s}"
-}
-
-if [[ "$1" == "--expand" ]]; then
-  expand "${2:?--expand needs a string}"
-  print
-  exit 0
-fi
-
-if [[ "$1" == "--workspace" ]]; then
-  shift
-  export PATH="${PATH}:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin"
-  exec python3 -c '
-import json, os, pathlib, sys
-
-def serve_noop_mcp(server_name: str) -> None:
-    for raw in sys.stdin:
-        line = raw.strip()
-        if not line:
-            continue
-        try:
-            msg = json.loads(line)
-        except Exception:
-            continue
-        if not isinstance(msg, dict) or "id" not in msg:
-            continue
-        req_id = msg["id"]
-        method = msg.get("method", "")
-        params = msg.get("params") if isinstance(msg.get("params"), dict) else {}
-        if method == "initialize":
-            proto = params.get("protocolVersion")
-            if not isinstance(proto, str) or not proto:
-                proto = "2024-11-05"
-            result = {
-                "protocolVersion": proto,
-                "capabilities": {"tools": {}},
-                "serverInfo": {"name": server_name, "version": "0.0.0"},
-            }
-        elif method == "ping":
-            result = {}
-        elif method == "tools/list":
-            result = {"tools": []}
-        elif method == "resources/list":
-            result = {"resources": []}
-        elif method == "resources/templates/list":
-            result = {"resourceTemplates": []}
-        elif method == "prompts/list":
-            result = {"prompts": []}
-        else:
-            err = {"jsonrpc": "2.0", "id": req_id, "error": {"code": -32601, "message": f"Method not found: {method}"}}
-            sys.stdout.write(json.dumps(err) + "\n")
-            sys.stdout.flush()
-            continue
-        sys.stdout.write(json.dumps({"jsonrpc": "2.0", "id": req_id, "result": result}) + "\n")
-        sys.stdout.flush()
-
-bridge_path = pathlib.Path(sys.argv[1]).resolve()
-args = sys.argv[2:]
-if not args or not args[0] or args[0].startswith("-"):
-    sys.stderr.write("usage: mcp_stdio_bridge --workspace <server_name> [--fallback-http <url> [\"Header: value\" ...]]\n")
-    sys.exit(2)
-
-server_name = args[0]
-rest = args[1:]
-fallback_url = None
-fallback_headers = []
-if rest:
-    if rest[0] == "--fallback-http" and len(rest) >= 2:
-        fallback_url = rest[1]
-        fallback_headers = rest[2:]
-    else:
-        sys.stderr.write("usage: mcp_stdio_bridge --workspace <server_name> [--fallback-http <url> [\"Header: value\" ...]]\n")
-        sys.exit(2)
-
-home = pathlib.Path.home().resolve()
-stop_dirs = {
-    pathlib.Path("/"),
-    home,
-    pathlib.Path("/Users"),
-    pathlib.Path("/home"),
-    pathlib.Path("/tmp"),
-    pathlib.Path("/private"),
-    pathlib.Path("/private/tmp"),
-    pathlib.Path("/var"),
-}
-cwd = pathlib.Path(os.environ.get("MCP_WORKSPACE_DIR") or os.getcwd()).resolve()
-
-workspace_dir = None
-workspace_cfg = None
-for candidate in (cwd, *cwd.parents):
-    if candidate in stop_dirs:
-        break
-    cfg_file = candidate / ".agents" / "mcp_config.json"
-    if cfg_file.is_file():
-        workspace_dir = candidate
-        workspace_cfg = cfg_file
-        break
-
-if workspace_cfg is not None and workspace_dir is not None:
-    try:
-        data = json.loads(workspace_cfg.read_text(encoding="utf-8"))
-    except Exception as exc:
-        sys.stderr.write(f"mcp_stdio_bridge: failed to parse {workspace_cfg}: {exc}\n")
-        serve_noop_mcp(server_name)
-        sys.exit(0)
-    servers = data.get("mcpServers") if isinstance(data, dict) else None
-    entry = servers.get(server_name) if isinstance(servers, dict) else None
-    if not isinstance(entry, dict) or entry.get("disabled") is True:
-        serve_noop_mcp(server_name)
-        sys.exit(0)
-
-    child_env = dict(os.environ)
-    if isinstance(entry.get("env"), dict):
-        for k, v in entry["env"].items():
-            child_env[str(k)] = str(v)
-
-    raw_cwd = entry.get("cwd")
-    target_cwd = pathlib.Path(raw_cwd).expanduser() if isinstance(raw_cwd, str) and raw_cwd.strip() else workspace_dir
-    os.chdir(target_cwd)
-
-    cmd = entry.get("command")
-    if isinstance(cmd, str) and cmd:
-        cmd_args = [str(a) for a in (entry.get("args") or []) if a is not None]
-        if os.path.basename(cmd) == bridge_path.name:
-            if cmd_args[:1] == ["--workspace"]:
-                sys.stderr.write(f"mcp_stdio_bridge: ignoring recursive --workspace entry in {workspace_cfg}\n")
-                serve_noop_mcp(server_name)
-                sys.exit(0)
-            if not os.path.isfile(cmd):
-                cmd = str(bridge_path)
-        os.execvpe(cmd, [cmd, *cmd_args], child_env)
-
-    url = entry.get("serverUrl") or entry.get("url")
-    if isinstance(url, str) and url.strip():
-        hdrs = entry.get("headers") if isinstance(entry.get("headers"), dict) else {}
-        hdr_args = [f"{k}: {v}" for k, v in hdrs.items()]
-        os.execvpe(str(bridge_path), [str(bridge_path), url.strip(), *hdr_args], child_env)
-
-    serve_noop_mcp(server_name)
-    sys.exit(0)
-
-raw_cwd_str = os.environ.get("MCP_WORKSPACE_DIR") or os.getcwd()
-is_gui_root = (cwd == pathlib.Path("/") or raw_cwd_str == "/" or str(cwd).startswith("/Applications/"))
-if is_gui_root and fallback_url:
-    os.execvpe(str(bridge_path), [str(bridge_path), fallback_url, *fallback_headers], os.environ)
-
-serve_noop_mcp(server_name)
-' "${0:A}" "$@"
-fi
-
-force_mcp_remote=0
-if [[ "$1" == "--use-mcp-remote" ]]; then
-  force_mcp_remote=1
-  shift
-fi
-
-if (( $# < 1 )); then
-  print -u2 "usage: mcp_stdio_bridge [--use-mcp-remote] <url> ['Header: value' ...]"
-  exit 2
-fi
 
 export PATH="${PATH}:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin"
 
-# Secrets usually live in shell profiles; load them without touching stdout
-# (stdout carries the MCP JSON-RPC stream).
-{
-  [[ -f "$HOME/.config/mcp-bridge.env" ]] && source "$HOME/.config/mcp-bridge.env"
-  [[ -f "$HOME/.zshenv" ]] && source "$HOME/.zshenv"
-} >&2
+if ! command -v node >/dev/null 2>&1; then
+  for d in "$HOME/.volta/bin" "$HOME/.fnm/current/bin" "$HOME/.asdf/shims"; do
+    [[ -x "$d/node" ]] && export PATH="$d:$PATH" && break
+  done
+fi
 
-url=$1
-shift
-
-typeset -a expanded_hdrs
-typeset -a remote_hdrs
-has_static_auth=0
-for item in "$@"; do
-  expanded=$(expand "$item")
-  expanded_hdrs+=("$expanded")
-  remote_hdrs+=(--header "$expanded")
-  hdr_key=${expanded%%:*}
-  hdr_key_lower=${(L)${hdr_key// /}}
-  case "$hdr_key_lower" in
-    authorization|accesstoken|token|x-api-key|api-key|x-auth-token)
-      has_static_auth=1
-      ;;
-  esac
-done
-
-is_loopback=0
-case "$url" in
-  http://127.0.0.1[:/]*|http://127.0.0.1|http://localhost[:/]*|http://localhost|http://\[::1\][:/]*|http://\[::1\]|https://127.0.0.1[:/]*|https://127.0.0.1|https://localhost[:/]*|https://localhost|https://\[::1\][:/]*|https://\[::1\])
-    is_loopback=1
-    ;;
-esac
-
-script_dir=${0:A:h}
-direct_script="$script_dir/mcp_http_stdio_bridge.mjs"
-transport_pref=${MCP_BRIDGE_TRANSPORT:-auto}
-
-use_direct=0
-if (( ! force_mcp_remote )) && [[ "$transport_pref" != "mcp-remote" ]]; then
-  if [[ "$transport_pref" == "direct" ]] || (( has_static_auth || is_loopback )); then
-    if [[ -f "$direct_script" ]] && command -v node >/dev/null 2>&1; then
-      use_direct=1
-    fi
+if ! command -v node >/dev/null 2>&1; then
+  typeset -a nvm_bins
+  nvm_bins=("$HOME"/.nvm/versions/node/*/bin(NOn))
+  if (( ${#nvm_bins} > 0 )) && [[ -x "${nvm_bins[1]}/node" ]]; then
+    export PATH="${nvm_bins[1]}:$PATH"
   fi
 fi
 
-if (( use_direct )); then
-  export MCP_BRIDGE_HDR_COUNT=${#expanded_hdrs[@]}
-  idx=0
-  for item in "${expanded_hdrs[@]}"; do
-    export "MCP_BRIDGE_HDR_${idx}=${item}"
-    (( idx++ ))
-  done
-  exec node "$direct_script" "$url"
+if ! command -v node >/dev/null 2>&1; then
+  {
+    [[ -f "$HOME/.config/mcp-bridge.env" ]] && source "$HOME/.config/mcp-bridge.env"
+    [[ -f "$HOME/.zshenv" ]] && source "$HOME/.zshenv"
+  } >&2
 fi
 
-if command -v mcp-remote >/dev/null 2>&1; then
-  exec mcp-remote "$url" "${remote_hdrs[@]}"
-fi
-exec npx -y mcp-remote "$url" "${remote_hdrs[@]}"
+bridge_abs=${0:A}
+exec node "${bridge_abs:h}/mcp_http_stdio_bridge.mjs" --bridge-path "$bridge_abs" "$@"
