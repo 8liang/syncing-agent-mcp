@@ -328,22 +328,111 @@ function runDirectHttpBridge(url, headerPairs) {
     if (buffer.trim()) emitSseEvent(buffer);
   }
 
-  async function forwardMessage(rawLine, msg) {
+  // Loopback services (e.g. the Cocos editor plugin) are often simply not
+  // running. Failing `initialize` makes some hosts (Antigravity) abort the
+  // whole session, so answer it locally and keep retrying upstream lazily.
+  const degradeOnUnreachable = isLoopbackUrl(url) && process.env.MCP_BRIDGE_STRICT !== "1";
+  let degraded = false;
+  let savedInitParams = null;
+  let lastReconnectAt = 0;
+
+  function localInitResult(params) {
+    const proto = params && typeof params.protocolVersion === "string" && params.protocolVersion ? params.protocolVersion : "2024-11-05";
+    return {
+      protocolVersion: proto,
+      capabilities: { tools: { listChanged: true } },
+      serverInfo: { name: "mcp-bridge-offline", version: "0.0.0" },
+      instructions: `Upstream ${url} is unreachable (service not running). Tools will appear once it starts.`,
+    };
+  }
+
+  async function postUpstream(body) {
     const headers = { ...baseHeaders };
     if (sessionId) headers["Mcp-Session-Id"] = sessionId;
+    const res = await fetch(url, { method: "POST", headers, body });
+    const nextSid = res.headers.get("mcp-session-id");
+    if (nextSid) sessionId = nextSid;
+    return res;
+  }
+
+  async function tryReconnect() {
+    const now = Date.now();
+    if (now - lastReconnectAt < 3000) return false;
+    lastReconnectAt = now;
+    try {
+      sessionId = null;
+      const res = await postUpstream(
+        JSON.stringify({ jsonrpc: "2.0", id: "__bridge_reinit__", method: "initialize", params: savedInitParams || {} })
+      );
+      try {
+        await res.body?.cancel();
+      } catch {}
+      if (!res.ok) return false;
+      const ack = await postUpstream(JSON.stringify({ jsonrpc: "2.0", method: "notifications/initialized" }));
+      try {
+        await ack.body?.cancel();
+      } catch {}
+      degraded = false;
+      process.stderr.write(`mcp_http_stdio_bridge: upstream ${url} is back online\n`);
+      emitJson({ jsonrpc: "2.0", method: "notifications/tools/list_changed" });
+      return true;
+    } catch {
+      return false;
+    }
+  }
+
+  function answerDegraded(msg) {
+    const method = msg && typeof msg === "object" ? msg.method : "";
+    if (!hasRpcId(msg)) return; // drop notifications
+    const empty = {
+      ping: {},
+      "tools/list": { tools: [] },
+      "resources/list": { resources: [] },
+      "resources/templates/list": { resourceTemplates: [] },
+      "prompts/list": { prompts: [] },
+    };
+    if (method in empty) {
+      emitJson({ jsonrpc: "2.0", id: msg.id, result: empty[method] });
+      return;
+    }
+    emitRpcError(msg, `Upstream ${url} is unreachable (service not running)`);
+  }
+
+  async function forwardMessage(rawLine, msg) {
+    const isInit = Boolean(msg && typeof msg === "object" && !Array.isArray(msg) && msg.method === "initialize");
+    if (isInit) savedInitParams = msg.params || {};
+
+    if (degraded && isInit) {
+      // A fresh initialize must never error: probe upstream directly and fall
+      // back to the local offline result below if it is still down.
+      sessionId = null;
+      degraded = false;
+    } else if (degraded) {
+      if (!(await tryReconnect())) {
+        answerDegraded(msg);
+        return;
+      }
+    }
 
     let res;
     try {
-      res = await fetch(url, { method: "POST", headers, body: rawLine });
+      res = await postUpstream(rawLine);
     } catch (err) {
       const detail = err?.cause?.message ? `${err.message}: ${err.cause.message}` : (err?.message || String(err));
       process.stderr.write(`mcp_http_stdio_bridge: POST ${url} failed: ${detail}\n`);
+      if (degradeOnUnreachable) {
+        degraded = true;
+        lastReconnectAt = Date.now();
+        if (isInit) {
+          emitJson({ jsonrpc: "2.0", id: msg.id, result: localInitResult(msg.params) });
+        } else {
+          answerDegraded(msg);
+        }
+        return;
+      }
       emitRpcError(msg, `Network error: ${detail}`);
       return;
     }
-
-    const nextSid = res.headers.get("mcp-session-id");
-    if (nextSid) sessionId = nextSid;
 
     if (res.status === 202 || res.status === 204) {
       try {
